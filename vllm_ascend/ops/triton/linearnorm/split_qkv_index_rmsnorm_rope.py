@@ -121,7 +121,8 @@ def split_qkv_index_rmsnorm_rope_kernel(
     idx_qk_heads_per_iter: tl.constexpr,  # * tile * index_qk_head_num，reshape 用
     index_q_head_num: tl.constexpr,  # * indexer Q 头数
     index_qk_head_num: tl.constexpr,  # * indexer Q 头数 + 1（共享 index_k）
-    ATTN_OUT_FP8: tl.constexpr,  # * main Q/K/V clamp -> e4m3
+    Q_OUT_FP8: tl.constexpr,    # * main Q clamp -> e4m3 (False: bf16 for o_proj)
+    KV_OUT_FP8: tl.constexpr,   # * main K/V clamp -> e4m3 (True: fold insert_kv clamp+cast)
     INDEX_OUT_FP8: tl.constexpr,  # * indexer 输出 clamp ±448 再存 e4m3
 ):
     row_pid = tl.program_id(0)
@@ -251,7 +252,7 @@ def split_qkv_index_rmsnorm_rope_kernel(
             strides=(1, 1, 1),
         )
         # * FP8：RoPE 后 clamp ±448，再按输出 dtype store
-        if ATTN_OUT_FP8:
+        if Q_OUT_FP8:
             q_heads = tl.minimum(tl.maximum(q_heads, -448.0), 448.0)
         q_output_idx = output_q_nblk_idx[None, :] + row64[:, None] * q_hidden_size
         q_store_mask = (mmask[:, None]) & (output_q_nmask[None, :])
@@ -301,7 +302,7 @@ def split_qkv_index_rmsnorm_rope_kernel(
             sizes=(batch_size_per_iter_per_vec, kv_head_num, ATTN_HALF),
             strides=(1, 1, 1),
         )
-        if ATTN_OUT_FP8:
+        if KV_OUT_FP8:
             k_heads = tl.minimum(tl.maximum(k_heads, -448.0), 448.0)
         kv_output_idx = output_kv_nblk_idx[None, :] + row64[:, None] * kv_hidden_size
         k_store_mask = (mmask[:, None]) & (output_kv_nmask[None, :])
@@ -326,7 +327,7 @@ def split_qkv_index_rmsnorm_rope_kernel(
         idx = row64[:, None] * total_hidden_size + nblk_idx[None, :]
         values = tl.load(input_gm_ptr + idx, mask=mask)
         # * V 无 RoPE，FP8 仍先 clamp 再按输出 dtype store
-        if ATTN_OUT_FP8:
+        if KV_OUT_FP8:
             values = tl.minimum(tl.maximum(values.to(tl.float32), -448.0), 448.0)
         out_idx = row64[:, None] * kv_hidden_size + out_nblk_idx[None, :]
         out_mask = (mmask[:, None]) & (out_nmask[None, :])
@@ -511,7 +512,8 @@ def split_qkv_index_rmsnorm_rope_impl(
     head_dim: int,
     idx_head_dim: int,
     eps: float,
-    attn_out_fp8: bool = False,
+    q_out_fp8: bool = False,
+    kv_out_fp8: bool = False,
     indexer_out_fp8: bool = False,
     q_bias: torch.Tensor | None = None,
     k_bias: torch.Tensor | None = None,
@@ -519,7 +521,7 @@ def split_qkv_index_rmsnorm_rope_impl(
     """Fused split → Gemma RMSNorm → Neox RoPE（attn + indexer）。
 
     Concat 布局 ``[q | k | v | index_q | index_k]``。
-    ``attn_out_fp8=True`` 时 main Q/K/V clamp ±448 再写成 e4m3；
+    ``kv_out_fp8=True`` 时 main K/V clamp ±448 再写成 e4m3；
     ``indexer_out_fp8=True`` 时 indexer 同样 clamp ±448 再写成 e4m3。
     """
     input = input.contiguous()
@@ -536,12 +538,13 @@ def split_qkv_index_rmsnorm_rope_impl(
     attn_rope_dim = min(cache_dim, int(head_dim))
     idx_rope_dim = min(cache_dim, int(idx_head_dim))
     bias = q_bias is not None
-    attn_dtype = torch.float8_e4m3fn if attn_out_fp8 else input.dtype
+    q_dtype = torch.float8_e4m3fn if q_out_fp8 else input.dtype
+    kv_dtype = torch.float8_e4m3fn if kv_out_fp8 else input.dtype
     index_dtype = torch.float8_e4m3fn if indexer_out_fp8 else input.dtype
 
-    q_out = torch.empty(batch_size, q_hidden_size, device=input.device, dtype=attn_dtype)
-    k_out = torch.empty(batch_size, kv_hidden_size, device=input.device, dtype=attn_dtype)
-    v_out = torch.empty(batch_size, kv_hidden_size, device=input.device, dtype=attn_dtype)
+    q_out = torch.empty(batch_size, q_hidden_size, device=input.device, dtype=q_dtype)
+    k_out = torch.empty(batch_size, kv_hidden_size, device=input.device, dtype=kv_dtype)
+    v_out = torch.empty(batch_size, kv_hidden_size, device=input.device, dtype=kv_dtype)
     index_q_out = torch.empty(batch_size, index_q_size, device=input.device, dtype=index_dtype)
     index_k_out = torch.empty(batch_size, idx_head_dim, device=input.device, dtype=index_dtype)
 
@@ -612,7 +615,8 @@ def split_qkv_index_rmsnorm_rope_impl(
         int(idx_batch_tile * index_qk_head_num),
         index_q_head_num,
         index_qk_head_num,
-        attn_out_fp8,
+        q_out_fp8,
+        kv_out_fp8,
         indexer_out_fp8,
     )
     return q_out, k_out, v_out, index_q_out, index_k_out
@@ -632,17 +636,19 @@ def split_qkv_index_rmsnorm_rope_impl_fake(
     head_dim: int,
     idx_head_dim: int,
     eps: float,
-    attn_out_fp8: bool = False,
+    q_out_fp8: bool = False,
+    kv_out_fp8: bool = False,
     indexer_out_fp8: bool = False,
     q_bias: torch.Tensor | None = None,
     k_bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     batch_size = input.shape[0]
-    attn_dtype = torch.float8_e4m3fn if attn_out_fp8 else input.dtype
+    q_dtype = torch.float8_e4m3fn if q_out_fp8 else input.dtype
+    kv_dtype = torch.float8_e4m3fn if kv_out_fp8 else input.dtype
     index_dtype = torch.float8_e4m3fn if indexer_out_fp8 else input.dtype
-    q_output = torch.empty(batch_size, int(q_hidden_size), device=input.device, dtype=attn_dtype)
-    k_output = torch.empty(batch_size, int(kv_hidden_size), device=input.device, dtype=attn_dtype)
-    v_output = torch.empty(batch_size, int(kv_hidden_size), device=input.device, dtype=attn_dtype)
+    q_output = torch.empty(batch_size, int(q_hidden_size), device=input.device, dtype=q_dtype)
+    k_output = torch.empty(batch_size, int(kv_hidden_size), device=input.device, dtype=kv_dtype)
+    v_output = torch.empty(batch_size, int(kv_hidden_size), device=input.device, dtype=kv_dtype)
     index_q_output = torch.empty(
         batch_size, int(index_q_size), device=input.device, dtype=index_dtype
     )

@@ -1537,12 +1537,16 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         num_tokens = main_meta.num_actual_tokens
         k_insert = key[:num_tokens].view(-1, self.num_kv_heads, self.head_dim)
         v_insert = value[:num_tokens].view(-1, self.num_kv_heads, self.head_dim)
-        k_fp8 = k_insert.clamp(min=-FP8_E4M3_MAX, max=FP8_E4M3_MAX).to(
-            torch.float8_e4m3fn
-        )
-        v_fp8 = v_insert.clamp(min=-FP8_E4M3_MAX, max=FP8_E4M3_MAX).to(
-            torch.float8_e4m3fn
-        )
+        if k_insert.dtype == torch.float8_e4m3fn:
+            k_fp8 = k_insert
+            v_fp8 = v_insert
+        else:
+            k_fp8 = k_insert.clamp(min=-FP8_E4M3_MAX, max=FP8_E4M3_MAX).to(
+                torch.float8_e4m3fn
+            )
+            v_fp8 = v_insert.clamp(min=-FP8_E4M3_MAX, max=FP8_E4M3_MAX).to(
+                torch.float8_e4m3fn
+            )
         from vllm_ascend.device.device_op import DeviceOperator
 
         DeviceOperator.reshape_and_cache(
@@ -1609,7 +1613,8 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
                 head_dim=self.head_dim,
                 idx_head_dim=self.idx_head_dim,
                 eps=self.q_norm.variance_epsilon,
-                attn_out_fp8=False,
+                q_out_fp8=False,
+                kv_out_fp8=True,
                 indexer_out_fp8=self.indexer_kv_dtype in ("fp8", "fp8_e4m3"),
                 q_bias=None,
                 k_bias=None,
