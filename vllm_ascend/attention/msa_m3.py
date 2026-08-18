@@ -26,6 +26,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.parameter import BasevLLMParameter, BlockQuantScaleParameter
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.logger import init_logger
+from vllm.triton_utils import HAS_TRITON
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -1573,6 +1574,47 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         qkv, _ = self.qkv_proj(hidden_states)
+
+        #* 这里接入了自己的算子
+        if (
+            HAS_TRITON
+            and qkv.device.type == "npu"
+            and qkv.dtype == torch.bfloat16
+            and positions.ndim == 1
+            and getattr(self.rotary_emb, "is_neox_style", True)
+        ):
+            q_weight = getattr(self.q_norm, "weight_plus_one", None)
+            k_weight = getattr(self.k_norm, "weight_plus_one", None)
+            index_q_weight = getattr(self.index_q_norm, "weight_plus_one", None)
+            index_k_weight = getattr(self.index_k_norm, "weight_plus_one", None)
+            if q_weight is None:
+                q_weight = self.q_norm.weight + 1.0
+            if k_weight is None:
+                k_weight = self.k_norm.weight + 1.0
+            if index_q_weight is None:
+                index_q_weight = self.index_q_norm.weight + 1.0
+            if index_k_weight is None:
+                index_k_weight = self.index_k_norm.weight + 1.0
+            return torch.ops.vllm.qkv_index_rmsnorm_rope(
+                input=qkv.contiguous(),
+                cos_sin_cache=self.rotary_emb.cos_sin_cache,
+                positions=positions,
+                q_weight=q_weight,
+                k_weight=k_weight,
+                index_q_weight=index_q_weight,
+                index_k_weight=index_k_weight,
+                q_hidden_size=self.q_size,
+                kv_hidden_size=self.kv_size,
+                index_q_size=self.index_q_size,
+                head_dim=self.head_dim,
+                idx_head_dim=self.idx_head_dim,
+                eps=self.q_norm.variance_epsilon,
+                attn_out_fp8=False,
+                indexer_out_fp8=self.indexer_kv_dtype in ("fp8", "fp8_e4m3"),
+                q_bias=None,
+                k_bias=None,
+            )
+
         main_qkv_size = self.q_size + 2 * self.kv_size
         main_qkv = qkv.narrow(-1, 0, main_qkv_size)
         index_q = qkv.narrow(-1, main_qkv_size, self.index_q_size)
