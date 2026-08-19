@@ -53,6 +53,8 @@ def _build_cu_block_lens(
     return cu_block_lens
 
 def _to_fp8(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.dtype == torch.float8_e4m3fn:
+        return tensor
     return tensor.clamp(min=-FP8_E4M3_MAX, max=FP8_E4M3_MAX).to(torch.float8_e4m3fn)
 
 @torch.no_grad()
