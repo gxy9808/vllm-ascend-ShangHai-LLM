@@ -1599,12 +1599,9 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
                 index_q_weight = self.index_q_norm.weight + 1.0
             if index_k_weight is None:
                 index_k_weight = self.index_k_norm.weight + 1.0
-            cos_sin_cache = self.rotary_emb.cos_sin_cache
-            if cos_sin_cache.dtype != qkv.dtype:
-                cos_sin_cache = cos_sin_cache.to(qkv.dtype)
             return torch.ops.vllm.qkv_index_rmsnorm_rope(
                 input=qkv.contiguous(),
-                cos_sin_cache=cos_sin_cache,
+                cos_sin_cache=self.rotary_emb.cos_sin_cache,
                 positions=positions,
                 q_weight=q_weight,
                 k_weight=k_weight,
