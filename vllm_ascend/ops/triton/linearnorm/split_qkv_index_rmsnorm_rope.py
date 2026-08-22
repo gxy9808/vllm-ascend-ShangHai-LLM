@@ -204,13 +204,12 @@ def split_qkv_index_rmsnorm_rope_kernel(
         )
 
         # * Gemma RMSNorm：按 HEAD_DIM 归约，Q/K 头拼在一起算 rstd
-        # ! 用逐元素顺序累加替代 tl.sum，保证确定性（tl.sum 的硬件 reduction
-        # ! 树在不同运行时线程调度可能不同，导致浮点累加顺序不确定）
+        # ! 用 tl.dot 替代 tl.sum 保证确定性（tl.sum 的硬件 reduction 树
+        # ! 线程调度不确定，导致浮点累加顺序不同；tl.dot 累加顺序固定）
         x32 = values_tmp1.to(tl.float32)
         sq = x32 * x32
-        sum_sq = tl.zeros((qk_head_nums_per_iter_per_vec,), dtype=tl.float32)
-        for d in tl.range(HEAD_DIM):
-            sum_sq += sq[:, d]
+        ones_head = tl.full((HEAD_DIM, 1), 1.0, dtype=tl.float32)
+        sum_sq = tl.dot(sq, ones_head)  # [N, HEAD_DIM] @ [HEAD_DIM, 1] -> [N, 1]
         rstd = tl.rsqrt(sum_sq / HEAD_DIM + eps).reshape(
             qk_head_nums_per_iter_per_vec, 1
         )
@@ -399,12 +398,11 @@ def split_qkv_index_rmsnorm_rope_kernel(
         )
 
         # * Gemma RMSNorm：index_q 多头 + index_k 一头拼在一起按 IDX_HEAD_DIM 归约
-        # ! 用逐元素顺序累加替代 tl.sum，保证确定性
+        # ! 用 tl.dot 替代 tl.sum 保证确定性
         x32 = values_idx.to(tl.float32)
         sq = x32 * x32
-        sum_sq = tl.zeros((idx_qk_heads_per_iter,), dtype=tl.float32)
-        for d in tl.range(IDX_HEAD_DIM):
-            sum_sq += sq[:, d]
+        ones_idx = tl.full((IDX_HEAD_DIM, 1), 1.0, dtype=tl.float32)
+        sum_sq = tl.dot(sq, ones_idx)  # [N, IDX_HEAD_DIM] @ [IDX_HEAD_DIM, 1] -> [N, 1]
         rstd = tl.rsqrt(sum_sq / IDX_HEAD_DIM + eps).reshape(
             idx_qk_heads_per_iter, 1
         )
