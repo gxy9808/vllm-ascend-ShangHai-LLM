@@ -204,13 +204,9 @@ def split_qkv_index_rmsnorm_rope_kernel(
         )
 
         # * Gemma RMSNorm：按 HEAD_DIM 归约，Q/K 头拼在一起算 rstd
-        # ! 用 tl.dot 替代 tl.sum 保证确定性（tl.sum 的硬件 reduction 树
-        # ! 线程调度不确定，导致浮点累加顺序不同；tl.dot 累加顺序固定）
+        # ! num_warps=1 保证 tl.sum 使用单 warp shuffle reduction（固定顺序，确定性）
         x32 = values_tmp1.to(tl.float32)
-        sq = x32 * x32
-        ones_head = tl.full((HEAD_DIM, 1), 1.0, dtype=tl.float32)
-        sum_sq = tl.dot(sq, ones_head)  # [N, HEAD_DIM] @ [HEAD_DIM, 1] -> [N, 1]
-        rstd = tl.rsqrt(sum_sq / HEAD_DIM + eps).reshape(
+        rstd = tl.rsqrt(tl.sum(x32 * x32, axis=1) / HEAD_DIM + eps).reshape(
             qk_head_nums_per_iter_per_vec, 1
         )
         normalized_values = (x32 * rstd).reshape(
@@ -398,12 +394,8 @@ def split_qkv_index_rmsnorm_rope_kernel(
         )
 
         # * Gemma RMSNorm：index_q 多头 + index_k 一头拼在一起按 IDX_HEAD_DIM 归约
-        # ! 用 tl.dot 替代 tl.sum 保证确定性
         x32 = values_idx.to(tl.float32)
-        sq = x32 * x32
-        ones_idx = tl.full((IDX_HEAD_DIM, 1), 1.0, dtype=tl.float32)
-        sum_sq = tl.dot(sq, ones_idx)  # [N, IDX_HEAD_DIM] @ [IDX_HEAD_DIM, 1] -> [N, 1]
-        rstd = tl.rsqrt(sum_sq / IDX_HEAD_DIM + eps).reshape(
+        rstd = tl.rsqrt(tl.sum(x32 * x32, axis=1) / IDX_HEAD_DIM + eps).reshape(
             idx_qk_heads_per_iter, 1
         )
         normalized_idx = (x32 * rstd).reshape(
@@ -623,7 +615,7 @@ def split_qkv_index_rmsnorm_rope_impl(
         index_qk_head_num,
         attn_out_fp8,
         indexer_out_fp8,
-        multibuffer=False,
+        num_warps=1,
     )
     return q_out, k_out, v_out, index_q_out, index_k_out
 
