@@ -623,6 +623,7 @@ def split_qkv_index_rmsnorm_rope_impl(
         index_qk_head_num,
         attn_out_fp8,
         indexer_out_fp8,
+        multibuffer=False,
     )
     return q_out, k_out, v_out, index_q_out, index_k_out
 
