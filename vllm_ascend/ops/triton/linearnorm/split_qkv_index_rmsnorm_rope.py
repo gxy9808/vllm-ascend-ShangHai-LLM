@@ -569,7 +569,7 @@ def split_qkv_index_rmsnorm_rope_impl(
         + cache_dim * 4
         + index_q_head_num * idx_rope_dim
     )
-    batch_tile = _tokens_per_iter(elem, qk_factor)
+    batch_tile = _tokens_per_iter(elem, qk_factor, cap=1)
     idx_batch_tile = _tokens_per_iter(elem, idx_factor)
     v_batch_tile = _tokens_per_iter(elem, kv_hidden_size + 1, cap=4)
 
