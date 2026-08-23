@@ -203,9 +203,13 @@ def split_qkv_index_rmsnorm_rope_kernel(
             strides=(1, 1, 1),
         )
 
-        # * Gemma RMSNorm：按 HEAD_DIM 归约，Q/K 头拼在一起算 rstd
+        # * Gemma RMSNorm：用 tl.dot 做 reduction（走 MMA 硬件，累加顺序固定）
+        # ! 消融实验：验证 tl.sum 的非确定性是否由此处 reduction 引起
         x32 = values_tmp1.to(tl.float32)
-        rstd = tl.rsqrt(tl.sum(x32 * x32, axis=1) / HEAD_DIM + eps).reshape(
+        sq = x32 * x32
+        ones_vec = tl.full((HEAD_DIM, 1), 1.0, dtype=tl.float32)
+        sum_sq = tl.dot(sq, ones_vec).reshape(qk_head_nums_per_iter_per_vec)
+        rstd = tl.rsqrt(sum_sq / HEAD_DIM + eps).reshape(
             qk_head_nums_per_iter_per_vec, 1
         )
         normalized_values = (x32 * rstd).reshape(
@@ -392,7 +396,10 @@ def split_qkv_index_rmsnorm_rope_kernel(
             strides=(1, 1, 1),
         )
 
-        # * Gemma RMSNorm：index_q 多头 + index_k 一头拼在一起按 IDX_HEAD_DIM 归约
+        # * Gemma RMSNorm：indexer 归约
+        # ! IDX_HEAD_DIM 可能不是 16 的倍数，tl.dot 要求 K 是 16 对齐
+        # ! 用 tl.sum 作为对照（如果 main QK 的 tl.dot 确定了，indexer 仍有
+        # ! 非确定性，则说明 tl.sum 确实是问题来源）
         x32 = values_idx.to(tl.float32)
         rstd = tl.rsqrt(tl.sum(x32 * x32, axis=1) / IDX_HEAD_DIM + eps).reshape(
             idx_qk_heads_per_iter, 1
