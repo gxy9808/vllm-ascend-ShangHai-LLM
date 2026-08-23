@@ -150,7 +150,7 @@ def split_qkv_index_rmsnorm_rope_kernel(
     mblk_idx = tl.arange(0, batch_size_per_iter_per_vec) + input_batch_offset
     nblk_idx = tl.arange(0, q_hidden_size + kv_hidden_size)
     nmask = nblk_idx < total_hidden_size
-    pos_indices = input_batch_offset + tl.arange(0, batch_size_per_iter_per_vec)
+    # pos_indices no longer needed (cos/sin pre-gathered)
     output_q_nblk_idx = tl.arange(0, q_hidden_size)
     output_q_nmask = output_q_nblk_idx < q_hidden_size
     output_kv_nblk_idx = tl.arange(0, kv_hidden_size)
@@ -721,8 +721,8 @@ def qkv_index_rope_clamp_kernel(
     v_gm_ptr,
     index_q_gm_ptr,
     index_k_gm_ptr,
-    positions_gm_ptr,
-    cos_sin_cache_gm_ptr,
+    cos_gm_ptr,
+    sin_gm_ptr,
     batch_size,
     q_hidden_size: tl.constexpr,
     kv_hidden_size: tl.constexpr,
@@ -762,22 +762,17 @@ def qkv_index_rope_clamp_kernel(
     mblk_idx = tl.arange(0, batch_size_per_iter_per_vec) + input_batch_offset
     nblk_idx = tl.arange(0, q_hidden_size + kv_hidden_size)
     nmask = nblk_idx < total_hidden_size
-    pos_indices = input_batch_offset + tl.arange(0, batch_size_per_iter_per_vec)
+    # pos_indices no longer needed (cos/sin pre-gathered)
     output_q_nblk_idx = tl.arange(0, q_hidden_size)
     output_q_nmask = output_q_nblk_idx < q_hidden_size
     output_kv_nblk_idx = tl.arange(0, kv_hidden_size)
     output_kv_nmask = output_kv_nblk_idx < kv_hidden_size
-    sin_cos_range = tl.arange(0, ROPE_DIM)
-    cos_sin_cache_offset = cos_sin_cache_gm_ptr + sin_cos_range
-
     # * 1 main QK：load [q|k] → RoPE (no RMSNorm, data pre-normed)
+    # cos/sin pre-gathered in Python, passed as [batch, ATTN_HALF] tensors
+    cos_range = tl.arange(0, ATTN_HALF)
     for iter in tl.range(iter_num_per_vec):
         pos_offset = iter * batch_size_per_iter_per_vec
         mmask = (mblk_idx + pos_offset) < input_batch_offset_end
-        x = tl.load(
-            positions_gm_ptr + pos_indices + pos_offset,
-            mask=(pos_indices + pos_offset) < input_batch_offset_end,
-        )
         mask = (mmask[:, None]) & (nmask[None, :])
         row64 = (mblk_idx + pos_offset).to(tl.int64)
         idx = row64[:, None] * total_hidden_size + nblk_idx[None, :]
@@ -785,33 +780,13 @@ def qkv_index_rope_clamp_kernel(
             qk_head_nums_per_iter_per_vec, HEAD_DIM
         )
 
-        cache_rows = tl.zeros(
-            (batch_size_per_iter_per_vec, ROPE_DIM), dtype=tl.float32
-        )
-        for i in tl.range(batch_size_per_iter_per_vec):
-            pos = get_element(x, (i,))
-            cache_rows = insert_slice(
-                cache_rows,
-                tl.load(pos * ROPE_DIM + cos_sin_cache_offset[:, None])
-                .reshape(1, ROPE_DIM)
-                .to(tl.float32),
-                offsets=(i, 0),
-                sizes=(1, ROPE_DIM),
-                strides=(1, 1),
-            )
-        cache_rows = cache_rows.reshape(batch_size_per_iter_per_vec, 1, ROPE_DIM)
-        cos = extract_slice(
-            cache_rows,
-            offsets=(0, 0, 0),
-            sizes=(batch_size_per_iter_per_vec, 1, ATTN_HALF),
-            strides=(1, 1, 1),
-        )
-        sin = extract_slice(
-            cache_rows,
-            offsets=(0, 0, HALF_CACHE),
-            sizes=(batch_size_per_iter_per_vec, 1, ATTN_HALF),
-            strides=(1, 1, 1),
-        )
+        # Load pre-gathered cos/sin (no get_element/insert_slice loop)
+        cos = tl.load(cos_gm_ptr + row64[:, None] * ATTN_HALF + cos_range[None, :],
+                      mask=mmask[:, None] & (cos_range[None, :] < ATTN_HALF)).to(tl.float32)
+        sin = tl.load(sin_gm_ptr + row64[:, None] * ATTN_HALF + cos_range[None, :],
+                      mask=mmask[:, None] & (cos_range[None, :] < ATTN_HALF)).to(tl.float32)
+        cos = cos.reshape(batch_size_per_iter_per_vec, 1, ATTN_HALF)
+        sin = sin.reshape(batch_size_per_iter_per_vec, 1, ATTN_HALF)
 
         # * No RMSNorm: use loaded data directly (already normed by npu_rms_norm)
         normalized_values = values_tmp1.to(tl.float32).reshape(
@@ -935,19 +910,15 @@ def qkv_index_rope_clamp_kernel(
     idx_mblk = tl.arange(0, idx_batch_size_per_iter_per_vec) + input_batch_offset
     idx_nblk = index_offset + tl.arange(0, index_qk_hidden)
     idx_nmask = idx_nblk < total_hidden_size
-    idx_pos = input_batch_offset + tl.arange(0, idx_batch_size_per_iter_per_vec)
     out_iq_nblk = tl.arange(0, index_q_size)
     out_iq_nmask = out_iq_nblk < index_q_size
     out_ik_nblk = tl.arange(0, IDX_HEAD_DIM)
     out_ik_nmask = out_ik_nblk < IDX_HEAD_DIM
+    idx_cos_range = tl.arange(0, IDX_HALF)
 
     for iter in tl.range(idx_iter_num_per_vec):
         pos_offset = iter * idx_batch_size_per_iter_per_vec
         mmask = (idx_mblk + pos_offset) < input_batch_offset_end
-        x = tl.load(
-            positions_gm_ptr + idx_pos + pos_offset,
-            mask=(idx_pos + pos_offset) < input_batch_offset_end,
-        )
         mask = (mmask[:, None]) & (idx_nmask[None, :])
         row64 = (idx_mblk + pos_offset).to(tl.int64)
         idx = row64[:, None] * total_hidden_size + idx_nblk[None, :]
@@ -955,33 +926,13 @@ def qkv_index_rope_clamp_kernel(
             idx_qk_heads_per_iter, IDX_HEAD_DIM
         )
 
-        cache_rows = tl.zeros(
-            (idx_batch_size_per_iter_per_vec, ROPE_DIM), dtype=tl.float32
-        )
-        for i in tl.range(idx_batch_size_per_iter_per_vec):
-            pos = get_element(x, (i,))
-            cache_rows = insert_slice(
-                cache_rows,
-                tl.load(pos * ROPE_DIM + cos_sin_cache_offset[:, None])
-                .reshape(1, ROPE_DIM)
-                .to(tl.float32),
-                offsets=(i, 0),
-                sizes=(1, ROPE_DIM),
-                strides=(1, 1),
-            )
-        cache_rows = cache_rows.reshape(idx_batch_size_per_iter_per_vec, 1, ROPE_DIM)
-        cos = extract_slice(
-            cache_rows,
-            offsets=(0, 0, 0),
-            sizes=(idx_batch_size_per_iter_per_vec, 1, IDX_HALF),
-            strides=(1, 1, 1),
-        )
-        sin = extract_slice(
-            cache_rows,
-            offsets=(0, 0, HALF_CACHE),
-            sizes=(idx_batch_size_per_iter_per_vec, 1, IDX_HALF),
-            strides=(1, 1, 1),
-        )
+        # Load pre-gathered cos/sin for indexer
+        cos = tl.load(cos_gm_ptr + row64[:, None] * IDX_HALF + idx_cos_range[None, :],
+                      mask=mmask[:, None] & (idx_cos_range[None, :] < IDX_HALF)).to(tl.float32)
+        sin = tl.load(sin_gm_ptr + row64[:, None] * IDX_HALF + idx_cos_range[None, :],
+                      mask=mmask[:, None] & (idx_cos_range[None, :] < IDX_HALF)).to(tl.float32)
+        cos = cos.reshape(idx_batch_size_per_iter_per_vec, 1, IDX_HALF)
+        sin = sin.reshape(idx_batch_size_per_iter_per_vec, 1, IDX_HALF)
 
         # * No RMSNorm: use loaded data directly
         normalized_idx = values_idx.to(tl.float32).reshape(
@@ -1101,6 +1052,20 @@ def qkv_index_rope_clamp_impl(
     cache_dim = int(cos_sin_cache.shape[-1])
     attn_rope_dim = min(cache_dim, int(head_dim))
     idx_rope_dim = min(cache_dim, int(idx_head_dim))
+    attn_half = attn_rope_dim // 2
+    idx_half = idx_rope_dim // 2
+
+    # Pre-gather cos/sin in Python (deterministic, no get_element/insert_slice)
+    cos_sin_gathered = cos_sin_cache[positions]  # [batch, cache_dim]
+    cos_main = cos_sin_gathered[:, :attn_half].contiguous()   # [batch, attn_half]
+    sin_main = cos_sin_gathered[:, attn_half:2*attn_half].contiguous()  # [batch, attn_half]
+    # For indexer: if idx_half != attn_half, need separate gather
+    if idx_half == attn_half:
+        cos_idx = cos_main
+        sin_idx = sin_main
+    else:
+        cos_idx = cos_sin_gathered[:, :idx_half].contiguous()
+        sin_idx = cos_sin_gathered[:, attn_half:attn_half+idx_half].contiguous()
     attn_dtype = torch.float8_e4m3fn if attn_out_fp8 else input.dtype
     index_dtype = torch.float8_e4m3fn if indexer_out_fp8 else input.dtype
 
@@ -1131,6 +1096,11 @@ def qkv_index_rope_clamp_impl(
     idx_batch_tile = _tokens_per_iter(elem, idx_factor)
     v_batch_tile = _tokens_per_iter(elem, kv_hidden_size + 1, cap=4)
 
+    # Use main cos/sin for all (indexer shares same cos/sin with different half width)
+    # For indexer with IDX_HALF != ATTN_HALF, we pass cos_main/sin_main but the
+    # kernel loads only first IDX_HALF elements. This works because cos/sin
+    # cache layout is [cos_0..cos_H/2-1 | sin_0..sin_H/2-1] and both ATTN_HALF
+    # and IDX_HALF are <= ROPE_DIM/2.
     grid = (num_vectorcore,)
     qkv_index_rope_clamp_kernel[grid](
         input,
@@ -1139,8 +1109,8 @@ def qkv_index_rope_clamp_impl(
         v_out,
         index_q_out,
         index_k_out,
-        positions,
-        cos_sin_cache,
+        cos_main,
+        sin_main,
         batch_size,
         q_hidden_size,
         kv_hidden_size,
