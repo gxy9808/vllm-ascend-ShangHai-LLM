@@ -479,20 +479,19 @@ def split_qkv_index_rmsnorm_rope_impl(
     index_k_weight = index_k_weight.contiguous()
     cos_sin_cache = cos_sin_cache.contiguous()
 
-    # Pre-gather cos/sin in Python (deterministic, avoids get_element loop in kernel)
-    cos_sin_gathered = cos_sin_cache[positions]  # [batch, cache_dim]
-    attn_half = attn_rope_dim // 2
-    idx_half = idx_rope_dim // 2
-    # Use the larger half for both cos and sin tensors
-    max_half = max(attn_half, idx_half)
-    cos_gathered = cos_sin_gathered[:, :max_half].contiguous()   # [batch, max_half]
-    sin_gathered = cos_sin_gathered[:, cache_dim // 2: cache_dim // 2 + max_half].contiguous()
-
     num_vectorcore = get_vectorcore_num()
     batch_size = input.shape[0]
     cache_dim = int(cos_sin_cache.shape[-1])
     attn_rope_dim = min(cache_dim, int(head_dim))
     idx_rope_dim = min(cache_dim, int(idx_head_dim))
+
+    # Pre-gather cos/sin in Python (deterministic, avoids get_element loop in kernel)
+    cos_sin_gathered = cos_sin_cache[positions]  # [batch, cache_dim]
+    attn_half = attn_rope_dim // 2
+    idx_half = idx_rope_dim // 2
+    max_half = max(attn_half, idx_half)
+    cos_gathered = cos_sin_gathered[:, :max_half].contiguous()
+    sin_gathered = cos_sin_gathered[:, cache_dim // 2: cache_dim // 2 + max_half].contiguous()
     bias = q_bias is not None
     attn_dtype = torch.float8_e4m3fn if attn_out_fp8 else input.dtype
     index_dtype = torch.float8_e4m3fn if indexer_out_fp8 else input.dtype
