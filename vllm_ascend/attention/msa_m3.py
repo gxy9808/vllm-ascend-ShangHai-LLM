@@ -1591,29 +1591,35 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             index_q = qkv.narrow(-1, main_qkv_size, self.index_q_size)
             index_k = qkv.narrow(-1, main_qkv_size + self.index_q_size, self.idx_head_dim)
 
+            # ABLATION A: RMSNorm uses C++ op (deterministic), RoPE uses Triton kernel
+            from vllm_ascend.ops.triton.linearnorm.split_qkv_index_rmsnorm_rope import _triton_rope_neox
+            cos_sin_cache = self.rotary_emb.cos_sin_cache
             q, k, v = main_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            # ABLATION B: RMSNorm uses tl.sum (Triton, potentially non-deterministic)
-            q, k = self._qk_norm_triton(q, k)
-            # RoPE uses C++ op (deterministic)
-            q, k = self.rotary_emb(positions, q, k)
+            # RMSNorm: C++ op (deterministic)
+            q, k = self._qk_norm(q, k)
+            # RoPE: Triton kernel (testing if this causes non-determinism)
+            q = q.reshape(-1, self.head_dim).contiguous()
+            k = k.reshape(-1, self.head_dim).contiguous()
+            q = _triton_rope_neox(q, cos_sin_cache, positions, self.head_dim).reshape(-1, self.q_size)
+            k = _triton_rope_neox(k, cos_sin_cache, positions, self.head_dim).reshape(-1, self.kv_size)
             q = q.contiguous()
             k = k.contiguous()
             v = v.contiguous()
 
-            # ABLATION B: indexer RMSNorm also uses tl.sum
-            index_q, index_k = self._index_qk_norm_triton(index_q, index_k)
-            if self.indexer_kv_dtype in ("fp8", "fp8_e4m3"):
-                index_q, index_k = self.rotary_emb(
-                    positions, index_q, index_k, out_dtype=torch.float8_e4m3fn,
-                )
-            else:
-                index_q, index_k = self.rotary_emb(positions, index_q, index_k)
+            # indexer: RMSNorm C++ op + RoPE Triton kernel
+            index_q, index_k = self._index_qk_norm(index_q, index_k)
+            index_q = index_q.reshape(-1, self.idx_head_dim).contiguous()
+            index_k = index_k.reshape(-1, self.idx_head_dim).contiguous()
+            index_q = _triton_rope_neox(index_q, cos_sin_cache, positions, self.idx_head_dim).reshape(-1, self.index_q_size)
+            index_k = _triton_rope_neox(index_k, cos_sin_cache, positions, self.idx_head_dim).reshape(-1, self.idx_head_dim)
 
-            # fp8 clamp+cast for Q/K/V (folds _insert_kv and _to_fp8 clamp+cast)
+            # fp8 clamp+cast for Q/K/V
             if self.indexer_kv_dtype in ("fp8", "fp8_e4m3"):
                 q = q.clamp(min=-FP8_E4M3_MAX, max=FP8_E4M3_MAX).to(torch.float8_e4m3fn)
                 k = k.clamp(min=-FP8_E4M3_MAX, max=FP8_E4M3_MAX).to(torch.float8_e4m3fn)
                 v = v.clamp(min=-FP8_E4M3_MAX, max=FP8_E4M3_MAX).to(torch.float8_e4m3fn)
+                index_q = index_q.clamp(min=-FP8_E4M3_MAX, max=FP8_E4M3_MAX).to(torch.float8_e4m3fn)
+                index_k = index_k.clamp(min=-FP8_E4M3_MAX, max=FP8_E4M3_MAX).to(torch.float8_e4m3fn)
 
             return q, k, v, index_q, index_k
 

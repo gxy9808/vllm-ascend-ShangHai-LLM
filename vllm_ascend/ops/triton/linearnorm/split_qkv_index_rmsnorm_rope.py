@@ -709,3 +709,64 @@ def _triton_rmsnorm(
         eps=eps,
     )
     return out
+
+
+# === Ablation A: standalone Triton RoPE (NeoX) ===
+
+@triton.jit
+def _rope_neox_kernel(
+    x_ptr,
+    out_ptr,
+    cos_sin_cache_ptr,
+    positions_ptr,
+    n_rows,
+    HEAD_DIM: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    HALF_ROPE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    if pid >= n_rows:
+        return
+    pos = tl.load(positions_ptr + pid)
+    cols = tl.arange(0, HEAD_DIM)
+    x = tl.load(x_ptr + pid * HEAD_DIM + cols).to(tl.float32)
+    cos_sin = tl.load(cos_sin_cache_ptr + pos * ROPE_DIM + tl.arange(0, ROPE_DIM)).to(tl.float32)
+    cos = cos_sin[:HALF_ROPE].reshape(1, HALF_ROPE)
+    sin = cos_sin[HALF_ROPE:].reshape(1, HALF_ROPE)
+    x1 = x[:HALF_ROPE].reshape(1, HALF_ROPE)
+    x2 = x[HALF_ROPE:].reshape(1, HALF_ROPE)
+    out1 = x1 * cos - x2 * sin
+    out2 = x2 * cos + x1 * sin
+    out = tl.cat(out1, out2, can_reorder=False).reshape(HEAD_DIM)
+    tl.store(out_ptr + pid * HEAD_DIM + cols, out.to(out_ptr.dtype.element_ty))
+
+
+def _triton_rope_neox(
+    x: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    head_dim: int,
+) -> torch.Tensor:
+    """Standalone NeoX RoPE using Triton (for ablation A: test if RoPE
+    fusion is the non-determinism source).
+
+    x: [N, HEAD_DIM] (already normed)
+    cos_sin_cache: [max_pos, ROPE_DIM] = concat(cos, sin)
+    positions: [N]
+    returns: [N, HEAD_DIM]
+    """
+    x = x.contiguous()
+    cos_sin_cache = cos_sin_cache.contiguous()
+    positions = positions.contiguous()
+    n_rows = x.shape[0]
+    rope_dim = int(cos_sin_cache.shape[-1])
+    half_rope = min(rope_dim, head_dim) // 2
+    out = torch.empty_like(x)
+    grid = (n_rows,)
+    _rope_neox_kernel[grid](
+        x, out, cos_sin_cache, positions, n_rows,
+        HEAD_DIM=head_dim,
+        ROPE_DIM=rope_dim,
+        HALF_ROPE=half_rope,
+    )
+    return out
