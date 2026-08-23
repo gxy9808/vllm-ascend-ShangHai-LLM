@@ -204,23 +204,8 @@ def split_qkv_index_rmsnorm_rope_kernel(
         )
 
         # * Gemma RMSNorm：按 HEAD_DIM 归约，Q/K 头拼在一起算 rstd
-        # ! 用 extract_slice 逐列累加替代 tl.sum，保证确定性
-        # ! tl.sum 的硬件 reduction 树线程调度不确定；extract_slice 逐列提取
-        # ! 后顺序相加，累加顺序固定为 0+1+2+...+HEAD_DIM-1
-        # ! 注意：Ascend Triton 不支持 tensor 标量索引 (blk[:, 0])，
-        # ! 必须用 extract_slice 提取单列
         x32 = values_tmp1.to(tl.float32)
-        sq = x32 * x32
-        sum_sq = tl.zeros((qk_head_nums_per_iter_per_vec,), dtype=tl.float32)
-        for d in range(HEAD_DIM):
-            col = extract_slice(
-                sq,
-                offsets=(0, d),
-                sizes=(qk_head_nums_per_iter_per_vec, 1),
-                strides=(1, 1),
-            ).reshape(qk_head_nums_per_iter_per_vec)
-            sum_sq = sum_sq + col
-        rstd = tl.rsqrt(sum_sq / HEAD_DIM + eps).reshape(
+        rstd = tl.rsqrt(tl.sum(x32 * x32, axis=1) / HEAD_DIM + eps).reshape(
             qk_head_nums_per_iter_per_vec, 1
         )
         normalized_values = (x32 * rstd).reshape(
@@ -408,19 +393,8 @@ def split_qkv_index_rmsnorm_rope_kernel(
         )
 
         # * Gemma RMSNorm：index_q 多头 + index_k 一头拼在一起按 IDX_HEAD_DIM 归约
-        # ! 用 extract_slice 逐列累加替代 tl.sum，保证确定性
         x32 = values_idx.to(tl.float32)
-        sq = x32 * x32
-        sum_sq = tl.zeros((idx_qk_heads_per_iter,), dtype=tl.float32)
-        for d in range(IDX_HEAD_DIM):
-            col = extract_slice(
-                sq,
-                offsets=(0, d),
-                sizes=(idx_qk_heads_per_iter, 1),
-                strides=(1, 1),
-            ).reshape(idx_qk_heads_per_iter)
-            sum_sq = sum_sq + col
-        rstd = tl.rsqrt(sum_sq / IDX_HEAD_DIM + eps).reshape(
+        rstd = tl.rsqrt(tl.sum(x32 * x32, axis=1) / IDX_HEAD_DIM + eps).reshape(
             idx_qk_heads_per_iter, 1
         )
         normalized_idx = (x32 * rstd).reshape(
