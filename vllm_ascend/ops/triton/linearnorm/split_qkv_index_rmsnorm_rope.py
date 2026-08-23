@@ -204,12 +204,20 @@ def split_qkv_index_rmsnorm_rope_kernel(
         )
 
         # * Gemma RMSNorm：按 HEAD_DIM 归约，Q/K 头拼在一起算 rstd
-        # ! 用 tl.dot 替代 tl.sum 保证确定性（tl.sum 的硬件 reduction 树
-        # ! 线程调度不确定；tl.dot 走 MMA 硬件，累加顺序固定）
+        # ! 用 extract_slice 逐列累加替代 tl.sum，保证确定性
+        # ! tl.sum 的硬件 reduction 树线程调度不确定；extract_slice 逐列提取
+        # ! 后顺序相加，累加顺序固定为 0+1+2+...+HEAD_DIM-1
         x32 = values_tmp1.to(tl.float32)
         sq = x32 * x32
-        ones_head = tl.full((HEAD_DIM, 1), 1.0, dtype=tl.float32)
-        sum_sq = tl.dot(sq, ones_head)
+        sum_sq = tl.zeros((qk_head_nums_per_iter_per_vec,), dtype=tl.float32)
+        for d in range(HEAD_DIM):
+            col = extract_slice(
+                sq,
+                offsets=(0, d),
+                sizes=(qk_head_nums_per_iter_per_vec, 1),
+                strides=(1, 1),
+            ).reshape(qk_head_nums_per_iter_per_vec)
+            sum_sq = sum_sq + col
         rstd = tl.rsqrt(sum_sq / HEAD_DIM + eps).reshape(
             qk_head_nums_per_iter_per_vec, 1
         )
@@ -398,11 +406,18 @@ def split_qkv_index_rmsnorm_rope_kernel(
         )
 
         # * Gemma RMSNorm：index_q 多头 + index_k 一头拼在一起按 IDX_HEAD_DIM 归约
-        # ! 用 tl.dot 替代 tl.sum 保证确定性
+        # ! 用 extract_slice 逐列累加替代 tl.sum，保证确定性
         x32 = values_idx.to(tl.float32)
         sq = x32 * x32
-        ones_idx = tl.full((IDX_HEAD_DIM, 1), 1.0, dtype=tl.float32)
-        sum_sq = tl.dot(sq, ones_idx)
+        sum_sq = tl.zeros((idx_qk_heads_per_iter,), dtype=tl.float32)
+        for d in range(IDX_HEAD_DIM):
+            col = extract_slice(
+                sq,
+                offsets=(0, d),
+                sizes=(idx_qk_heads_per_iter, 1),
+                strides=(1, 1),
+            ).reshape(idx_qk_heads_per_iter)
+            sum_sq = sum_sq + col
         rstd = tl.rsqrt(sum_sq / IDX_HEAD_DIM + eps).reshape(
             idx_qk_heads_per_iter, 1
         )
@@ -571,9 +586,9 @@ def split_qkv_index_rmsnorm_rope_impl(
         + cache_dim * 4
         + index_q_head_num * idx_rope_dim
     )
-    batch_tile = _tokens_per_iter(elem, qk_factor, cap=1)
-    idx_batch_tile = _tokens_per_iter(elem, idx_factor, cap=1)
-    v_batch_tile = _tokens_per_iter(elem, kv_hidden_size + 1, cap=2)
+    batch_tile = _tokens_per_iter(elem, qk_factor)
+    idx_batch_tile = _tokens_per_iter(elem, idx_factor)
+    v_batch_tile = _tokens_per_iter(elem, kv_hidden_size + 1, cap=4)
 
     dummy = q_weight
     q_bias = q_bias.contiguous() if q_bias is not None else dummy
