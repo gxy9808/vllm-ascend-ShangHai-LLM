@@ -79,7 +79,7 @@ def _tokens_per_iter(elem_size: int, elems_per_token: int, *, cap: int = 2) -> i
     return max(1, min(cap, n))
 
 
-@triton.jit(num_stages=1)
+@triton.jit
 def split_qkv_index_rmsnorm_rope_kernel(
     input_gm_ptr,  # * concat QKV 输入 [q|k|v|index_q|index_k]
     q_gm_ptr,  # * main Q 输出
