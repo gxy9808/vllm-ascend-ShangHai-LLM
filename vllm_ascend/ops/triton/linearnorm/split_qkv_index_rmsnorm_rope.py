@@ -728,17 +728,18 @@ def _rope_neox_kernel(
     if pid >= n_rows:
         return
     pos = tl.load(positions_ptr + pid)
-    cols = tl.arange(0, HEAD_DIM)
-    x = tl.load(x_ptr + pid * HEAD_DIM + cols).to(tl.float32)
-    cos_sin = tl.load(cos_sin_cache_ptr + pos * ROPE_DIM + tl.arange(0, ROPE_DIM)).to(tl.float32)
-    cos = cos_sin[:HALF_ROPE].reshape(1, HALF_ROPE)
-    sin = cos_sin[HALF_ROPE:].reshape(1, HALF_ROPE)
-    x1 = x[:HALF_ROPE].reshape(1, HALF_ROPE)
-    x2 = x[HALF_ROPE:].reshape(1, HALF_ROPE)
+    # Load cos and sin separately (avoid slice indexing)
+    cos = tl.load(cos_sin_cache_ptr + pos * ROPE_DIM + tl.arange(0, HALF_ROPE)).to(tl.float32)
+    sin = tl.load(cos_sin_cache_ptr + pos * ROPE_DIM + HALF_ROPE + tl.arange(0, HALF_ROPE)).to(tl.float32)
+    # Load x in two halves
+    x1 = tl.load(x_ptr + pid * HEAD_DIM + tl.arange(0, HALF_ROPE)).to(tl.float32)
+    x2 = tl.load(x_ptr + pid * HEAD_DIM + HALF_ROPE + tl.arange(0, HALF_ROPE)).to(tl.float32)
+    # NeoX RoPE
     out1 = x1 * cos - x2 * sin
     out2 = x2 * cos + x1 * sin
-    out = tl.cat(out1, out2, can_reorder=False).reshape(HEAD_DIM)
-    tl.store(out_ptr + pid * HEAD_DIM + cols, out.to(out_ptr.dtype.element_ty))
+    # Store
+    tl.store(out_ptr + pid * HEAD_DIM + tl.arange(0, HALF_ROPE), out1.to(out_ptr.dtype.element_ty))
+    tl.store(out_ptr + pid * HEAD_DIM + HALF_ROPE + tl.arange(0, HALF_ROPE), out2.to(out_ptr.dtype.element_ty))
 
 
 def _triton_rope_neox(
