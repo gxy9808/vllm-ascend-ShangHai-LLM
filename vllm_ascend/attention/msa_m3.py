@@ -1579,43 +1579,44 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         qkv, _ = self.qkv_proj(hidden_states)
 
-        #* 优化路径：用 C++ op 做 RMSNorm+RoPE（确定性），Python 层做 fp8 clamp+cast
+        #* 融合路径
         if (
-            qkv.device.type == "npu"
+            HAS_TRITON
+            and qkv.device.type == "npu"
             and qkv.dtype == torch.bfloat16
             and positions.ndim == 1
             and getattr(self.rotary_emb, "is_neox_style", True)
         ):
-            main_qkv_size = self.q_size + 2 * self.kv_size
-            main_qkv = qkv.narrow(-1, 0, main_qkv_size)
-            index_q = qkv.narrow(-1, main_qkv_size, self.index_q_size)
-            index_k = qkv.narrow(-1, main_qkv_size + self.index_q_size, self.idx_head_dim)
-
-            # RMSNorm: C++ op (deterministic), RoPE+clamp+cast: Triton kernel
-            q, k, v = main_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            q, k = self._qk_norm(q, k)
-            index_q, index_k = self._index_qk_norm(index_q, index_k)
-
-            # Re-concat normed data for the kernel
-            normed_input = torch.cat([
-                q.reshape(q.shape[0], -1),
-                k.reshape(k.shape[0], -1),
-                v,
-                index_q.reshape(index_q.shape[0], -1),
-                index_k.reshape(index_k.shape[0], -1),
-            ], dim=-1).contiguous()
-
-            return torch.ops.vllm.qkv_index_rope_clamp(
-                input=normed_input,
+            q_weight = getattr(self.q_norm, "weight_plus_one", None)
+            k_weight = getattr(self.k_norm, "weight_plus_one", None)
+            index_q_weight = getattr(self.index_q_norm, "weight_plus_one", None)
+            index_k_weight = getattr(self.index_k_norm, "weight_plus_one", None)
+            if q_weight is None:
+                q_weight = self.q_norm.weight + 1.0
+            if k_weight is None:
+                k_weight = self.k_norm.weight + 1.0
+            if index_q_weight is None:
+                index_q_weight = self.index_q_norm.weight + 1.0
+            if index_k_weight is None:
+                index_k_weight = self.index_k_norm.weight + 1.0
+            return torch.ops.vllm.qkv_index_rmsnorm_rope(
+                input=qkv.contiguous(),
                 cos_sin_cache=self.rotary_emb.cos_sin_cache,
                 positions=positions,
+                q_weight=q_weight,
+                k_weight=k_weight,
+                index_q_weight=index_q_weight,
+                index_k_weight=index_k_weight,
                 q_hidden_size=self.q_size,
                 kv_hidden_size=self.kv_size,
                 index_q_size=self.index_q_size,
                 head_dim=self.head_dim,
                 idx_head_dim=self.idx_head_dim,
+                eps=self.q_norm.variance_epsilon,
                 attn_out_fp8=True,
                 indexer_out_fp8=self.indexer_kv_dtype in ("fp8", "fp8_e4m3"),
+                q_bias=None,
+                k_bias=None,
             )
 
         main_qkv_size = self.q_size + 2 * self.kv_size
@@ -1703,7 +1704,6 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
 
         projected, _ = self.o_proj(attn_out)
         return projected
-
 
     def _qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
