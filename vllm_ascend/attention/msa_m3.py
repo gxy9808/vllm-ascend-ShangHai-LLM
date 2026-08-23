@@ -1579,7 +1579,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         qkv, _ = self.qkv_proj(hidden_states)
 
-        #* 融合路径：RMSNorm 用 npu_rms_norm（确定性），kernel 只做 RoPE+clamp+cast
+        #* 融合路径
         if (
             HAS_TRITON
             and qkv.device.type == "npu"
@@ -1587,42 +1587,36 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             and positions.ndim == 1
             and getattr(self.rotary_emb, "is_neox_style", True)
         ):
-            import torch_npu
-            main_qkv_size = self.q_size + 2 * self.kv_size
-            # 1. Split concat [q|k|v|index_q|index_k]
-            main_qkv = qkv.narrow(-1, 0, main_qkv_size).contiguous()
-            index_qk = qkv.narrow(-1, main_qkv_size, self.index_q_size + self.idx_head_dim).contiguous()
-            # 2. RMSNorm with npu_rms_norm (deterministic, same as fallback)
-            q_raw = main_qkv.narrow(-1, 0, self.q_size).reshape(-1, self.head_dim).contiguous()
-            k_raw = main_qkv.narrow(-1, self.q_size, self.kv_size).reshape(-1, self.head_dim).contiguous()
-            v_raw = main_qkv.narrow(-1, self.q_size + self.kv_size, self.kv_size).contiguous()
-            q_w = self.q_norm.weight_plus_one
-            k_w = self.k_norm.weight_plus_one
-            q_normed, _ = torch_npu.npu_rms_norm(q_raw, q_w, self.q_norm.variance_epsilon)
-            k_normed, _ = torch_npu.npu_rms_norm(k_raw, k_w, self.k_norm.variance_epsilon)
-            q_normed = q_normed.reshape(-1, self.q_size)
-            k_normed = k_normed.reshape(-1, self.kv_size)
-            # indexer norm
-            iq_raw = index_qk.narrow(-1, 0, self.index_q_size).reshape(-1, self.idx_head_dim).contiguous()
-            ik_raw = index_qk.narrow(-1, self.index_q_size, self.idx_head_dim).reshape(-1, self.idx_head_dim).contiguous()
-            iq_w = self.index_q_norm.weight_plus_one
-            ik_w = self.index_k_norm.weight_plus_one
-            iq_normed, _ = torch_npu.npu_rms_norm(iq_raw, iq_w, self.index_q_norm.variance_epsilon)
-            ik_normed, _ = torch_npu.npu_rms_norm(ik_raw, ik_w, self.index_k_norm.variance_epsilon)
-            iq_normed = iq_normed.reshape(-1, self.index_q_size)
-            ik_normed = ik_normed.reshape(-1, self.idx_head_dim)
-            # 3. Fused RoPE + clamp + cast kernel (no RMSNorm inside)
-            return torch.ops.vllm.qkv_index_rope_clamp(
-                q_normed, k_normed, v_raw, iq_normed, ik_normed,
+            q_weight = getattr(self.q_norm, "weight_plus_one", None)
+            k_weight = getattr(self.k_norm, "weight_plus_one", None)
+            index_q_weight = getattr(self.index_q_norm, "weight_plus_one", None)
+            index_k_weight = getattr(self.index_k_norm, "weight_plus_one", None)
+            if q_weight is None:
+                q_weight = self.q_norm.weight + 1.0
+            if k_weight is None:
+                k_weight = self.k_norm.weight + 1.0
+            if index_q_weight is None:
+                index_q_weight = self.index_q_norm.weight + 1.0
+            if index_k_weight is None:
+                index_k_weight = self.index_k_norm.weight + 1.0
+            return torch.ops.vllm.qkv_index_rmsnorm_rope(
+                input=qkv.contiguous(),
                 cos_sin_cache=self.rotary_emb.cos_sin_cache,
                 positions=positions,
+                q_weight=q_weight,
+                k_weight=k_weight,
+                index_q_weight=index_q_weight,
+                index_k_weight=index_k_weight,
                 q_hidden_size=self.q_size,
                 kv_hidden_size=self.kv_size,
                 index_q_size=self.index_q_size,
                 head_dim=self.head_dim,
                 idx_head_dim=self.idx_head_dim,
+                eps=self.q_norm.variance_epsilon,
                 attn_out_fp8=True,
                 indexer_out_fp8=self.indexer_kv_dtype in ("fp8", "fp8_e4m3"),
+                q_bias=None,
+                k_bias=None,
             )
 
         main_qkv_size = self.q_size + 2 * self.kv_size
