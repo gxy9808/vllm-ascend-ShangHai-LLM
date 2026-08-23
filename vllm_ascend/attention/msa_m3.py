@@ -1591,37 +1591,32 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             index_q = qkv.narrow(-1, main_qkv_size, self.index_q_size)
             index_k = qkv.narrow(-1, main_qkv_size + self.index_q_size, self.idx_head_dim)
 
-            # ABLATION A: RMSNorm uses C++ op (deterministic), RoPE uses Triton kernel
-            from vllm_ascend.ops.triton.linearnorm.split_qkv_index_rmsnorm_rope import _triton_rope_neox
-            cos_sin_cache = self.rotary_emb.cos_sin_cache
+            # RMSNorm: C++ op (deterministic), RoPE+clamp+cast: Triton kernel
             q, k, v = main_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            # RMSNorm: C++ op (deterministic)
             q, k = self._qk_norm(q, k)
-            # RoPE: Triton kernel (testing if this causes non-determinism)
-            q = q.reshape(-1, self.head_dim).contiguous()
-            k = k.reshape(-1, self.head_dim).contiguous()
-            q = _triton_rope_neox(q, cos_sin_cache, positions, self.head_dim).reshape(-1, self.q_size)
-            k = _triton_rope_neox(k, cos_sin_cache, positions, self.head_dim).reshape(-1, self.kv_size)
-            q = q.contiguous()
-            k = k.contiguous()
-            v = v.contiguous()
-
-            # indexer: RMSNorm C++ op + RoPE Triton kernel
             index_q, index_k = self._index_qk_norm(index_q, index_k)
-            index_q = index_q.reshape(-1, self.idx_head_dim).contiguous()
-            index_k = index_k.reshape(-1, self.idx_head_dim).contiguous()
-            index_q = _triton_rope_neox(index_q, cos_sin_cache, positions, self.idx_head_dim).reshape(-1, self.index_q_size)
-            index_k = _triton_rope_neox(index_k, cos_sin_cache, positions, self.idx_head_dim).reshape(-1, self.idx_head_dim)
 
-            # fp8 clamp+cast for Q/K/V
-            if self.indexer_kv_dtype in ("fp8", "fp8_e4m3"):
-                q = q.clamp(min=-FP8_E4M3_MAX, max=FP8_E4M3_MAX).to(torch.float8_e4m3fn)
-                k = k.clamp(min=-FP8_E4M3_MAX, max=FP8_E4M3_MAX).to(torch.float8_e4m3fn)
-                v = v.clamp(min=-FP8_E4M3_MAX, max=FP8_E4M3_MAX).to(torch.float8_e4m3fn)
-                index_q = index_q.clamp(min=-FP8_E4M3_MAX, max=FP8_E4M3_MAX).to(torch.float8_e4m3fn)
-                index_k = index_k.clamp(min=-FP8_E4M3_MAX, max=FP8_E4M3_MAX).to(torch.float8_e4m3fn)
+            # Re-concat normed data for the kernel
+            normed_input = torch.cat([
+                q.reshape(q.shape[0], -1),
+                k.reshape(k.shape[0], -1),
+                v,
+                index_q.reshape(index_q.shape[0], -1),
+                index_k.reshape(index_k.shape[0], -1),
+            ], dim=-1).contiguous()
 
-            return q, k, v, index_q, index_k
+            return torch.ops.vllm.qkv_index_rope_clamp(
+                input=normed_input,
+                cos_sin_cache=self.rotary_emb.cos_sin_cache,
+                positions=positions,
+                q_hidden_size=self.q_size,
+                kv_hidden_size=self.kv_size,
+                index_q_size=self.index_q_size,
+                head_dim=self.head_dim,
+                idx_head_dim=self.idx_head_dim,
+                attn_out_fp8=True,
+                indexer_out_fp8=self.indexer_kv_dtype in ("fp8", "fp8_e4m3"),
+            )
 
         main_qkv_size = self.q_size + 2 * self.kv_size
         main_qkv = qkv.narrow(-1, 0, main_qkv_size)
@@ -1709,36 +1704,6 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         projected, _ = self.o_proj(attn_out)
         return projected
 
-
-    def _qk_norm_triton(
-        self, q: torch.Tensor, k: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """ABLATION: RMSNorm using tl.sum (Triton) instead of npu_rms_norm."""
-        from vllm_ascend.ops.triton.linearnorm.split_qkv_index_rmsnorm_rope import _triton_rmsnorm
-        q_shape = q.shape
-        k_shape = k.shape
-        q = q.reshape(-1, self.head_dim).contiguous()
-        k = k.reshape(-1, self.head_dim).contiguous()
-        q_w = self.q_norm.weight_plus_one
-        k_w = self.k_norm.weight_plus_one
-        q = _triton_rmsnorm(q, q_w, self.q_norm.variance_epsilon).reshape(q_shape)
-        k = _triton_rmsnorm(k, k_w, self.k_norm.variance_epsilon).reshape(k_shape)
-        return q, k
-
-    def _index_qk_norm_triton(
-        self, idx_q: torch.Tensor, idx_k: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """ABLATION: indexer RMSNorm using tl_sum (Triton)."""
-        from vllm_ascend.ops.triton.linearnorm.split_qkv_index_rmsnorm_rope import _triton_rmsnorm
-        idx_q_shape = idx_q.shape
-        idx_k_shape = idx_k.shape
-        idx_q = idx_q.reshape(-1, self.idx_head_dim)
-        idx_k = idx_k.reshape(-1, self.idx_head_dim)
-        iq_w = self.index_q_norm.weight_plus_one
-        ik_w = self.index_k_norm.weight_plus_one
-        idx_q = _triton_rmsnorm(idx_q, iq_w, self.index_q_norm.variance_epsilon).reshape(idx_q_shape)
-        idx_k = _triton_rmsnorm(idx_k, ik_w, self.index_k_norm.variance_epsilon).reshape(idx_k_shape)
-        return idx_q, idx_k
 
     def _qk_norm(
         self, q: torch.Tensor, k: torch.Tensor

@@ -711,63 +711,494 @@ def _triton_rmsnorm(
     return out
 
 
-# === Ablation A: standalone Triton RoPE (NeoX) ===
+# === RoPE+clamp+cast only (no RMSNorm) ===
 
 @triton.jit
-def _rope_neox_kernel(
-    x_ptr,
-    out_ptr,
-    cos_sin_cache_ptr,
-    positions_ptr,
-    n_rows,
+def qkv_index_rope_clamp_kernel(
+    input_gm_ptr,
+    q_gm_ptr,
+    k_gm_ptr,
+    v_gm_ptr,
+    index_q_gm_ptr,
+    index_k_gm_ptr,
+    positions_gm_ptr,
+    cos_sin_cache_gm_ptr,
+    batch_size,
+    q_hidden_size: tl.constexpr,
+    kv_hidden_size: tl.constexpr,
+    index_q_size: tl.constexpr,
+    total_hidden_size: tl.constexpr,
+    index_offset: tl.constexpr,
+    index_qk_hidden: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    IDX_HEAD_DIM: tl.constexpr,
     ROPE_DIM: tl.constexpr,
-    HALF_ROPE: tl.constexpr,
+    HALF_CACHE: tl.constexpr,
+    ATTN_HALF: tl.constexpr,
+    IDX_HALF: tl.constexpr,
+    num_vectorcore: tl.constexpr,
+    batch_size_per_iter_per_vec: tl.constexpr,
+    qk_head_nums_per_iter_per_vec: tl.constexpr,
+    q_head_num: tl.constexpr,
+    kv_head_num: tl.constexpr,
+    qk_head_num_sum: tl.constexpr,
+    v_batch_size_per_iter_per_vec: tl.constexpr,
+    idx_batch_size_per_iter_per_vec: tl.constexpr,
+    idx_qk_heads_per_iter: tl.constexpr,
+    index_q_head_num: tl.constexpr,
+    index_qk_head_num: tl.constexpr,
+    ATTN_OUT_FP8: tl.constexpr,
+    INDEX_OUT_FP8: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    if pid >= n_rows:
-        return
-    pos = tl.load(positions_ptr + pid)
-    # Load cos and sin separately (avoid slice indexing)
-    cos = tl.load(cos_sin_cache_ptr + pos * ROPE_DIM + tl.arange(0, HALF_ROPE)).to(tl.float32)
-    sin = tl.load(cos_sin_cache_ptr + pos * ROPE_DIM + HALF_ROPE + tl.arange(0, HALF_ROPE)).to(tl.float32)
-    # Load x in two halves
-    x1 = tl.load(x_ptr + pid * HEAD_DIM + tl.arange(0, HALF_ROPE)).to(tl.float32)
-    x2 = tl.load(x_ptr + pid * HEAD_DIM + HALF_ROPE + tl.arange(0, HALF_ROPE)).to(tl.float32)
-    # NeoX RoPE
-    out1 = x1 * cos - x2 * sin
-    out2 = x2 * cos + x1 * sin
-    # Store
-    tl.store(out_ptr + pid * HEAD_DIM + tl.arange(0, HALF_ROPE), out1.to(out_ptr.dtype.element_ty))
-    tl.store(out_ptr + pid * HEAD_DIM + HALF_ROPE + tl.arange(0, HALF_ROPE), out2.to(out_ptr.dtype.element_ty))
+    row_pid = tl.program_id(0)
+
+    batch_size_per_vec = tl.cdiv(batch_size, num_vectorcore)
+    iter_num_per_vec = tl.cdiv(batch_size_per_vec, batch_size_per_iter_per_vec)
+    v_iter_num_per_vec = tl.cdiv(batch_size_per_vec, v_batch_size_per_iter_per_vec)
+    idx_iter_num_per_vec = tl.cdiv(batch_size_per_vec, idx_batch_size_per_iter_per_vec)
+    input_batch_offset = row_pid * batch_size_per_vec
+    input_batch_offset_end = min(input_batch_offset + batch_size_per_vec, batch_size)
+
+    mblk_idx = tl.arange(0, batch_size_per_iter_per_vec) + input_batch_offset
+    nblk_idx = tl.arange(0, q_hidden_size + kv_hidden_size)
+    nmask = nblk_idx < total_hidden_size
+    pos_indices = input_batch_offset + tl.arange(0, batch_size_per_iter_per_vec)
+    output_q_nblk_idx = tl.arange(0, q_hidden_size)
+    output_q_nmask = output_q_nblk_idx < q_hidden_size
+    output_kv_nblk_idx = tl.arange(0, kv_hidden_size)
+    output_kv_nmask = output_kv_nblk_idx < kv_hidden_size
+    sin_cos_range = tl.arange(0, ROPE_DIM)
+    cos_sin_cache_offset = cos_sin_cache_gm_ptr + sin_cos_range
+
+    # * 1 main QK：load [q|k] → RoPE (no RMSNorm, data pre-normed)
+    for iter in tl.range(iter_num_per_vec):
+        pos_offset = iter * batch_size_per_iter_per_vec
+        mmask = (mblk_idx + pos_offset) < input_batch_offset_end
+        x = tl.load(
+            positions_gm_ptr + pos_indices + pos_offset,
+            mask=(pos_indices + pos_offset) < input_batch_offset_end,
+        )
+        mask = (mmask[:, None]) & (nmask[None, :])
+        row64 = (mblk_idx + pos_offset).to(tl.int64)
+        idx = row64[:, None] * total_hidden_size + nblk_idx[None, :]
+        values_tmp1 = tl.load(input_gm_ptr + idx, mask=mask).reshape(
+            qk_head_nums_per_iter_per_vec, HEAD_DIM
+        )
+
+        cache_rows = tl.zeros(
+            (batch_size_per_iter_per_vec, ROPE_DIM), dtype=tl.float32
+        )
+        for i in tl.range(batch_size_per_iter_per_vec):
+            pos = get_element(x, (i,))
+            cache_rows = insert_slice(
+                cache_rows,
+                tl.load(pos * ROPE_DIM + cos_sin_cache_offset[:, None])
+                .reshape(1, ROPE_DIM)
+                .to(tl.float32),
+                offsets=(i, 0),
+                sizes=(1, ROPE_DIM),
+                strides=(1, 1),
+            )
+        cache_rows = cache_rows.reshape(batch_size_per_iter_per_vec, 1, ROPE_DIM)
+        cos = extract_slice(
+            cache_rows,
+            offsets=(0, 0, 0),
+            sizes=(batch_size_per_iter_per_vec, 1, ATTN_HALF),
+            strides=(1, 1, 1),
+        )
+        sin = extract_slice(
+            cache_rows,
+            offsets=(0, 0, HALF_CACHE),
+            sizes=(batch_size_per_iter_per_vec, 1, ATTN_HALF),
+            strides=(1, 1, 1),
+        )
+
+        # * No RMSNorm: use loaded data directly (already normed by npu_rms_norm)
+        normalized_values = values_tmp1.to(tl.float32).reshape(
+            batch_size_per_iter_per_vec, qk_head_num_sum, HEAD_DIM
+        )
+
+        # * Q：RoPE (no weight multiply)
+        q_heads = extract_slice(
+            normalized_values,
+            offsets=(0, 0, 0),
+            sizes=(batch_size_per_iter_per_vec, q_head_num, HEAD_DIM),
+            strides=(1, 1, 1),
+        )
+        q_x1 = extract_slice(
+            q_heads,
+            offsets=(0, 0, 0),
+            sizes=(batch_size_per_iter_per_vec, q_head_num, ATTN_HALF),
+            strides=(1, 1, 1),
+        )
+        q_x2 = extract_slice(
+            q_heads,
+            offsets=(0, 0, ATTN_HALF),
+            sizes=(batch_size_per_iter_per_vec, q_head_num, ATTN_HALF),
+            strides=(1, 1, 1),
+        )
+        q_heads = insert_slice(
+            q_heads,
+            q_x1 * cos - q_x2 * sin,
+            offsets=(0, 0, 0),
+            sizes=(batch_size_per_iter_per_vec, q_head_num, ATTN_HALF),
+            strides=(1, 1, 1),
+        )
+        q_heads = insert_slice(
+            q_heads,
+            q_x2 * cos + q_x1 * sin,
+            offsets=(0, 0, ATTN_HALF),
+            sizes=(batch_size_per_iter_per_vec, q_head_num, ATTN_HALF),
+            strides=(1, 1, 1),
+        )
+        if ATTN_OUT_FP8:
+            q_heads = tl.minimum(tl.maximum(q_heads, -448.0), 448.0)
+        q_output_idx = output_q_nblk_idx[None, :] + row64[:, None] * q_hidden_size
+        q_store_mask = (mmask[:, None]) & (output_q_nmask[None, :])
+        tl.store(
+            q_gm_ptr + q_output_idx,
+            q_heads.reshape(batch_size_per_iter_per_vec, q_hidden_size).to(
+                q_gm_ptr.dtype.element_ty
+            ),
+            mask=q_store_mask,
+        )
+
+        # * K：RoPE (no weight multiply)
+        k_heads = extract_slice(
+            normalized_values,
+            offsets=(0, q_head_num, 0),
+            sizes=(batch_size_per_iter_per_vec, kv_head_num, HEAD_DIM),
+            strides=(1, 1, 1),
+        )
+        k_x1 = extract_slice(
+            k_heads,
+            offsets=(0, 0, 0),
+            sizes=(batch_size_per_iter_per_vec, kv_head_num, ATTN_HALF),
+            strides=(1, 1, 1),
+        )
+        k_x2 = extract_slice(
+            k_heads,
+            offsets=(0, 0, ATTN_HALF),
+            sizes=(batch_size_per_iter_per_vec, kv_head_num, ATTN_HALF),
+            strides=(1, 1, 1),
+        )
+        k_heads = insert_slice(
+            k_heads,
+            k_x1 * cos - k_x2 * sin,
+            offsets=(0, 0, 0),
+            sizes=(batch_size_per_iter_per_vec, kv_head_num, ATTN_HALF),
+            strides=(1, 1, 1),
+        )
+        k_heads = insert_slice(
+            k_heads,
+            k_x2 * cos + k_x1 * sin,
+            offsets=(0, 0, ATTN_HALF),
+            sizes=(batch_size_per_iter_per_vec, kv_head_num, ATTN_HALF),
+            strides=(1, 1, 1),
+        )
+        if ATTN_OUT_FP8:
+            k_heads = tl.minimum(tl.maximum(k_heads, -448.0), 448.0)
+        kv_output_idx = output_kv_nblk_idx[None, :] + row64[:, None] * kv_hidden_size
+        k_store_mask = (mmask[:, None]) & (output_kv_nmask[None, :])
+        tl.store(
+            k_gm_ptr + kv_output_idx,
+            k_heads.reshape(batch_size_per_iter_per_vec, kv_hidden_size).to(
+                k_gm_ptr.dtype.element_ty
+            ),
+            mask=k_store_mask,
+        )
+
+    # * V：copy + clamp (no RoPE, no RMSNorm)
+    mblk_idx = tl.arange(0, v_batch_size_per_iter_per_vec) + input_batch_offset
+    nblk_idx = (q_hidden_size + kv_hidden_size) + tl.arange(0, kv_hidden_size)
+    nmask = nblk_idx < total_hidden_size
+    out_nblk_idx = tl.arange(0, kv_hidden_size)
+    out_nmask = out_nblk_idx < kv_hidden_size
+    for _ in tl.range(v_iter_num_per_vec):
+        mmask = mblk_idx < input_batch_offset_end
+        mask = (mmask[:, None]) & (nmask[None, :])
+        row64 = mblk_idx.to(tl.int64)
+        idx = row64[:, None] * total_hidden_size + nblk_idx[None, :]
+        values = tl.load(input_gm_ptr + idx, mask=mask)
+        if ATTN_OUT_FP8:
+            values = tl.minimum(tl.maximum(values.to(tl.float32), -448.0), 448.0)
+        out_idx = row64[:, None] * kv_hidden_size + out_nblk_idx[None, :]
+        out_mask = (mmask[:, None]) & (out_nmask[None, :])
+        tl.store(
+            v_gm_ptr + out_idx,
+            values.to(v_gm_ptr.dtype.element_ty),
+            mask=out_mask,
+        )
+        mblk_idx += v_batch_size_per_iter_per_vec
+
+    # * indexer：load → RoPE → clamp (no RMSNorm)
+    idx_mblk = tl.arange(0, idx_batch_size_per_iter_per_vec) + input_batch_offset
+    idx_nblk = index_offset + tl.arange(0, index_qk_hidden)
+    idx_nmask = idx_nblk < total_hidden_size
+    idx_pos = input_batch_offset + tl.arange(0, idx_batch_size_per_iter_per_vec)
+    out_iq_nblk = tl.arange(0, index_q_size)
+    out_iq_nmask = out_iq_nblk < index_q_size
+    out_ik_nblk = tl.arange(0, IDX_HEAD_DIM)
+    out_ik_nmask = out_ik_nblk < IDX_HEAD_DIM
+
+    for iter in tl.range(idx_iter_num_per_vec):
+        pos_offset = iter * idx_batch_size_per_iter_per_vec
+        mmask = (idx_mblk + pos_offset) < input_batch_offset_end
+        x = tl.load(
+            positions_gm_ptr + idx_pos + pos_offset,
+            mask=(idx_pos + pos_offset) < input_batch_offset_end,
+        )
+        mask = (mmask[:, None]) & (idx_nmask[None, :])
+        row64 = (idx_mblk + pos_offset).to(tl.int64)
+        idx = row64[:, None] * total_hidden_size + idx_nblk[None, :]
+        values_idx = tl.load(input_gm_ptr + idx, mask=mask).reshape(
+            idx_qk_heads_per_iter, IDX_HEAD_DIM
+        )
+
+        cache_rows = tl.zeros(
+            (idx_batch_size_per_iter_per_vec, ROPE_DIM), dtype=tl.float32
+        )
+        for i in tl.range(idx_batch_size_per_iter_per_vec):
+            pos = get_element(x, (i,))
+            cache_rows = insert_slice(
+                cache_rows,
+                tl.load(pos * ROPE_DIM + cos_sin_cache_offset[:, None])
+                .reshape(1, ROPE_DIM)
+                .to(tl.float32),
+                offsets=(i, 0),
+                sizes=(1, ROPE_DIM),
+                strides=(1, 1),
+            )
+        cache_rows = cache_rows.reshape(idx_batch_size_per_iter_per_vec, 1, ROPE_DIM)
+        cos = extract_slice(
+            cache_rows,
+            offsets=(0, 0, 0),
+            sizes=(idx_batch_size_per_iter_per_vec, 1, IDX_HALF),
+            strides=(1, 1, 1),
+        )
+        sin = extract_slice(
+            cache_rows,
+            offsets=(0, 0, HALF_CACHE),
+            sizes=(idx_batch_size_per_iter_per_vec, 1, IDX_HALF),
+            strides=(1, 1, 1),
+        )
+
+        # * No RMSNorm: use loaded data directly
+        normalized_idx = values_idx.to(tl.float32).reshape(
+            idx_batch_size_per_iter_per_vec, index_qk_head_num, IDX_HEAD_DIM
+        )
+
+        # * index_q：RoPE (no weight multiply)
+        iq_heads = extract_slice(
+            normalized_idx,
+            offsets=(0, 0, 0),
+            sizes=(idx_batch_size_per_iter_per_vec, index_q_head_num, IDX_HEAD_DIM),
+            strides=(1, 1, 1),
+        )
+        iq_x1 = extract_slice(
+            iq_heads,
+            offsets=(0, 0, 0),
+            sizes=(idx_batch_size_per_iter_per_vec, index_q_head_num, IDX_HALF),
+            strides=(1, 1, 1),
+        )
+        iq_x2 = extract_slice(
+            iq_heads,
+            offsets=(0, 0, IDX_HALF),
+            sizes=(idx_batch_size_per_iter_per_vec, index_q_head_num, IDX_HALF),
+            strides=(1, 1, 1),
+        )
+        iq_heads = insert_slice(
+            iq_heads,
+            iq_x1 * cos - iq_x2 * sin,
+            offsets=(0, 0, 0),
+            sizes=(idx_batch_size_per_iter_per_vec, index_q_head_num, IDX_HALF),
+            strides=(1, 1, 1),
+        )
+        iq_heads = insert_slice(
+            iq_heads,
+            iq_x2 * cos + iq_x1 * sin,
+            offsets=(0, 0, IDX_HALF),
+            sizes=(idx_batch_size_per_iter_per_vec, index_q_head_num, IDX_HALF),
+            strides=(1, 1, 1),
+        )
+
+        # * index_k：RoPE (no weight multiply)
+        ik_heads = extract_slice(
+            normalized_idx,
+            offsets=(0, index_q_head_num, 0),
+            sizes=(idx_batch_size_per_iter_per_vec, 1, IDX_HEAD_DIM),
+            strides=(1, 1, 1),
+        )
+        ik_x1 = extract_slice(
+            ik_heads,
+            offsets=(0, 0, 0),
+            sizes=(idx_batch_size_per_iter_per_vec, 1, IDX_HALF),
+            strides=(1, 1, 1),
+        )
+        ik_x2 = extract_slice(
+            ik_heads,
+            offsets=(0, 0, IDX_HALF),
+            sizes=(idx_batch_size_per_iter_per_vec, 1, IDX_HALF),
+            strides=(1, 1, 1),
+        )
+        ik_heads = insert_slice(
+            ik_heads,
+            ik_x1 * cos - ik_x2 * sin,
+            offsets=(0, 0, 0),
+            sizes=(idx_batch_size_per_iter_per_vec, 1, IDX_HALF),
+            strides=(1, 1, 1),
+        )
+        ik_heads = insert_slice(
+            ik_heads,
+            ik_x2 * cos + ik_x1 * sin,
+            offsets=(0, 0, IDX_HALF),
+            sizes=(idx_batch_size_per_iter_per_vec, 1, IDX_HALF),
+            strides=(1, 1, 1),
+        )
+
+        if INDEX_OUT_FP8:
+            iq_heads = tl.minimum(tl.maximum(iq_heads, -448.0), 448.0)
+            ik_heads = tl.minimum(tl.maximum(ik_heads, -448.0), 448.0)
+
+        iq_idx = out_iq_nblk[None, :] + row64[:, None] * index_q_size
+        ik_idx = out_ik_nblk[None, :] + row64[:, None] * IDX_HEAD_DIM
+        iq_mask = (mmask[:, None]) & (out_iq_nmask[None, :])
+        ik_mask = (mmask[:, None]) & (out_ik_nmask[None, :])
+        tl.store(
+            index_q_gm_ptr + iq_idx,
+            iq_heads.reshape(idx_batch_size_per_iter_per_vec, index_q_size).to(
+                index_q_gm_ptr.dtype.element_ty
+            ),
+            mask=iq_mask,
+        )
+        tl.store(
+            index_k_gm_ptr + ik_idx,
+            ik_heads.reshape(idx_batch_size_per_iter_per_vec, IDX_HEAD_DIM).to(
+                index_k_gm_ptr.dtype.element_ty
+            ),
+            mask=ik_mask,
+        )
 
 
-def _triton_rope_neox(
-    x: torch.Tensor,
+def qkv_index_rope_clamp_impl(
+    input: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     positions: torch.Tensor,
+    q_hidden_size: int,
+    kv_hidden_size: int,
+    index_q_size: int,
     head_dim: int,
-) -> torch.Tensor:
-    """Standalone NeoX RoPE using Triton (for ablation A: test if RoPE
-    fusion is the non-determinism source).
-
-    x: [N, HEAD_DIM] (already normed)
-    cos_sin_cache: [max_pos, ROPE_DIM] = concat(cos, sin)
-    positions: [N]
-    returns: [N, HEAD_DIM]
-    """
-    x = x.contiguous()
+    idx_head_dim: int,
+    attn_out_fp8: bool = False,
+    indexer_out_fp8: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    input = input.contiguous()
     cos_sin_cache = cos_sin_cache.contiguous()
     positions = positions.contiguous()
-    n_rows = x.shape[0]
-    rope_dim = int(cos_sin_cache.shape[-1])
-    half_rope = min(rope_dim, head_dim) // 2
-    out = torch.empty_like(x)
-    grid = (n_rows,)
-    _rope_neox_kernel[grid](
-        x, out, cos_sin_cache, positions, n_rows,
-        HEAD_DIM=head_dim,
-        ROPE_DIM=rope_dim,
-        HALF_ROPE=half_rope,
+
+    num_vectorcore = get_vectorcore_num()
+    batch_size = input.shape[0]
+    cache_dim = int(cos_sin_cache.shape[-1])
+    attn_rope_dim = min(cache_dim, int(head_dim))
+    idx_rope_dim = min(cache_dim, int(idx_head_dim))
+    attn_dtype = torch.float8_e4m3fn if attn_out_fp8 else input.dtype
+    index_dtype = torch.float8_e4m3fn if indexer_out_fp8 else input.dtype
+
+    q_out = torch.empty(batch_size, q_hidden_size, device=input.device, dtype=attn_dtype)
+    k_out = torch.empty(batch_size, kv_hidden_size, device=input.device, dtype=attn_dtype)
+    v_out = torch.empty(batch_size, kv_hidden_size, device=input.device, dtype=attn_dtype)
+    index_q_out = torch.empty(batch_size, index_q_size, device=input.device, dtype=index_dtype)
+    index_k_out = torch.empty(batch_size, idx_head_dim, device=input.device, dtype=index_dtype)
+
+    q_head_num = q_hidden_size // head_dim
+    kv_head_num = kv_hidden_size // head_dim
+    index_q_head_num = index_q_size // idx_head_dim
+    index_qk_head_num = index_q_head_num + 1
+    index_qk_hidden = index_qk_head_num * idx_head_dim
+    index_offset = q_hidden_size + 2 * kv_hidden_size
+    total_hidden_size = index_offset + index_qk_hidden
+    qk_head_num_sum = q_head_num + kv_head_num
+
+    elem = input.element_size()
+    qk_factor = 5 * q_hidden_size + 3 * kv_hidden_size + cache_dim * 4 + q_head_num * attn_rope_dim
+    idx_factor = (
+        5 * index_q_size
+        + 3 * idx_head_dim
+        + cache_dim * 4
+        + index_q_head_num * idx_rope_dim
     )
-    return out
+    batch_tile = _tokens_per_iter(elem, qk_factor)
+    idx_batch_tile = _tokens_per_iter(elem, idx_factor)
+    v_batch_tile = _tokens_per_iter(elem, kv_hidden_size + 1, cap=4)
+
+    grid = (num_vectorcore,)
+    qkv_index_rope_clamp_kernel[grid](
+        input,
+        q_out,
+        k_out,
+        v_out,
+        index_q_out,
+        index_k_out,
+        positions,
+        cos_sin_cache,
+        batch_size,
+        q_hidden_size,
+        kv_hidden_size,
+        index_q_size,
+        total_hidden_size,
+        index_offset,
+        index_qk_hidden,
+        head_dim,
+        idx_head_dim,
+        cache_dim,
+        cache_dim // 2,
+        attn_rope_dim // 2,
+        idx_rope_dim // 2,
+        num_vectorcore,
+        int(batch_tile),
+        int(batch_tile * qk_head_num_sum),
+        q_head_num,
+        kv_head_num,
+        qk_head_num_sum,
+        int(v_batch_tile),
+        int(idx_batch_tile),
+        int(idx_batch_tile * index_qk_head_num),
+        index_q_head_num,
+        index_qk_head_num,
+        attn_out_fp8,
+        indexer_out_fp8,
+    )
+    return q_out, k_out, v_out, index_q_out, index_k_out
+
+
+def qkv_index_rope_clamp_impl_fake(
+    input: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    q_hidden_size: int,
+    kv_hidden_size: int,
+    index_q_size: int,
+    head_dim: int,
+    idx_head_dim: int,
+    attn_out_fp8: bool = False,
+    indexer_out_fp8: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch_size = input.shape[0]
+    attn_dtype = torch.float8_e4m3fn if attn_out_fp8 else input.dtype
+    index_dtype = torch.float8_e4m3fn if indexer_out_fp8 else input.dtype
+    return (
+        torch.empty(batch_size, int(q_hidden_size), device=input.device, dtype=attn_dtype),
+        torch.empty(batch_size, int(kv_hidden_size), device=input.device, dtype=attn_dtype),
+        torch.empty(batch_size, int(kv_hidden_size), device=input.device, dtype=attn_dtype),
+        torch.empty(batch_size, int(index_q_size), device=input.device, dtype=index_dtype),
+        torch.empty(batch_size, int(idx_head_dim), device=input.device, dtype=index_dtype),
+    )
+
+
+direct_register_custom_op(
+    op_name="qkv_index_rope_clamp",
+    op_func=qkv_index_rope_clamp_impl,
+    fake_impl=qkv_index_rope_clamp_impl_fake,
+    mutates_args=[],
+    dispatch_key="PrivateUse1",
+)
