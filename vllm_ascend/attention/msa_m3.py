@@ -1592,13 +1592,16 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             index_k = qkv.narrow(-1, main_qkv_size + self.index_q_size, self.idx_head_dim)
 
             q, k, v = main_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            q, k = self._qk_norm(q, k)
+            # ABLATION B: RMSNorm uses tl.sum (Triton, potentially non-deterministic)
+            q, k = self._qk_norm_triton(q, k)
+            # RoPE uses C++ op (deterministic)
             q, k = self.rotary_emb(positions, q, k)
             q = q.contiguous()
             k = k.contiguous()
             v = v.contiguous()
 
-            index_q, index_k = self._index_qk_norm(index_q, index_k)
+            # ABLATION B: indexer RMSNorm also uses tl.sum
+            index_q, index_k = self._index_qk_norm_triton(index_q, index_k)
             if self.indexer_kv_dtype in ("fp8", "fp8_e4m3"):
                 index_q, index_k = self.rotary_emb(
                     positions, index_q, index_k, out_dtype=torch.float8_e4m3fn,
@@ -1699,6 +1702,37 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
 
         projected, _ = self.o_proj(attn_out)
         return projected
+
+
+    def _qk_norm_triton(
+        self, q: torch.Tensor, k: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """ABLATION: RMSNorm using tl.sum (Triton) instead of npu_rms_norm."""
+        from vllm_ascend.ops.triton.linearnorm.split_qkv_index_rmsnorm_rope import _triton_rmsnorm
+        q_shape = q.shape
+        k_shape = k.shape
+        q = q.reshape(-1, self.head_dim).contiguous()
+        k = k.reshape(-1, self.head_dim).contiguous()
+        q_w = self.q_norm.weight_plus_one
+        k_w = self.k_norm.weight_plus_one
+        q = _triton_rmsnorm(q, q_w, self.q_norm.variance_epsilon).reshape(q_shape)
+        k = _triton_rmsnorm(k, k_w, self.k_norm.variance_epsilon).reshape(k_shape)
+        return q, k
+
+    def _index_qk_norm_triton(
+        self, idx_q: torch.Tensor, idx_k: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """ABLATION: indexer RMSNorm using tl_sum (Triton)."""
+        from vllm_ascend.ops.triton.linearnorm.split_qkv_index_rmsnorm_rope import _triton_rmsnorm
+        idx_q_shape = idx_q.shape
+        idx_k_shape = idx_k.shape
+        idx_q = idx_q.reshape(-1, self.idx_head_dim)
+        idx_k = idx_k.reshape(-1, self.idx_head_dim)
+        iq_w = self.index_q_norm.weight_plus_one
+        ik_w = self.index_k_norm.weight_plus_one
+        idx_q = _triton_rmsnorm(idx_q, iq_w, self.index_q_norm.variance_epsilon).reshape(idx_q_shape)
+        idx_k = _triton_rmsnorm(idx_k, ik_w, self.index_k_norm.variance_epsilon).reshape(idx_k_shape)
+        return idx_q, idx_k
 
     def _qk_norm(
         self, q: torch.Tensor, k: torch.Tensor

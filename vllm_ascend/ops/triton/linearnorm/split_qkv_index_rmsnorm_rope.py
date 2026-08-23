@@ -659,3 +659,53 @@ direct_register_custom_op(
     mutates_args=[],
     dispatch_key="PrivateUse1",
 )
+
+
+# === Ablation: standalone tl.sum RMSNorm ===
+
+@triton.jit
+def _rmsnorm_sum_kernel(
+    x_ptr,
+    w_ptr,
+    out_ptr,
+    n_rows,
+    HEAD_DIM: tl.constexpr,
+    eps: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    if pid >= n_rows:
+        return
+    cols = tl.arange(0, HEAD_DIM)
+    x = tl.load(x_ptr + pid * HEAD_DIM + cols).to(tl.float32)
+    w = tl.load(w_ptr + cols).to(tl.float32)
+    sq = x * x
+    sum_sq = tl.sum(sq, axis=0)
+    rstd = tl.rsqrt(sum_sq / HEAD_DIM + eps)
+    out = (x * rstd * w).to(out_ptr.dtype.element_ty)
+    tl.store(out_ptr + pid * HEAD_DIM + cols, out)
+
+
+def _triton_rmsnorm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Standalone RMSNorm using tl.sum (for ablation: test if tl.sum is
+    the non-determinism source).
+
+    x: [N, HEAD_DIM]
+    weight: [HEAD_DIM] (already 1+w for Gemma)
+    returns: [N, HEAD_DIM]
+    """
+    x = x.contiguous()
+    weight = weight.contiguous()
+    n_rows = x.shape[0]
+    head_dim = x.shape[1]
+    out = torch.empty_like(x)
+    grid = (n_rows,)
+    _rmsnorm_sum_kernel[grid](
+        x, weight, out, n_rows,
+        HEAD_DIM=head_dim,
+        eps=eps,
+    )
+    return out
