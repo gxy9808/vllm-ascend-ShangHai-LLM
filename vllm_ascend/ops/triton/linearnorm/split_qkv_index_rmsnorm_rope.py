@@ -123,7 +123,6 @@ def split_qkv_index_rmsnorm_rope_kernel(
     index_qk_head_num: tl.constexpr,  # * indexer Q 头数 + 1（共享 index_k）
     ATTN_OUT_FP8: tl.constexpr,  # * main Q/K/V clamp -> e4m3 (attn_out forced bf16 by empty_like)
     INDEX_OUT_FP8: tl.constexpr,  # * indexer 输出 clamp ±448 再存 e4m3
-    SKIP_RMSNORM: tl.constexpr,  # * ABLATION A: skip RMSNorm (data pre-normed by npu_rms_norm)
 ):
     row_pid = tl.program_id(0)
 
@@ -205,18 +204,13 @@ def split_qkv_index_rmsnorm_rope_kernel(
         )
 
         # * Gemma RMSNorm：按 HEAD_DIM 归约，Q/K 头拼在一起算 rstd
-        if SKIP_RMSNORM:
-            normalized_values = values_tmp1.to(tl.float32).reshape(
-                batch_size_per_iter_per_vec, qk_head_num_sum, HEAD_DIM
-            )
-        else:
-            x32 = values_tmp1.to(tl.float32)
-            rstd = tl.rsqrt(tl.sum(x32 * x32, axis=1) / HEAD_DIM + eps).reshape(
-                qk_head_nums_per_iter_per_vec, 1
-            )
-            normalized_values = (x32 * rstd).reshape(
-                batch_size_per_iter_per_vec, qk_head_num_sum, HEAD_DIM
-            )
+        x32 = values_tmp1.to(tl.float32)
+        rstd = tl.rsqrt(tl.sum(x32 * x32, axis=1) / HEAD_DIM + eps).reshape(
+            qk_head_nums_per_iter_per_vec, 1
+        )
+        normalized_values = (x32 * rstd).reshape(
+            batch_size_per_iter_per_vec, qk_head_num_sum, HEAD_DIM
+        )
 
         # * Q：×(1+w) → NeoX [x1*cos-x2*sin | x2*cos+x1*sin]，尾维不转
         q_heads = extract_slice(
@@ -399,18 +393,13 @@ def split_qkv_index_rmsnorm_rope_kernel(
         )
 
         # * Gemma RMSNorm：index_q 多头 + index_k 一头拼在一起按 IDX_HEAD_DIM 归约
-        if SKIP_RMSNORM:
-            normalized_idx = values_idx.to(tl.float32).reshape(
-                idx_batch_size_per_iter_per_vec, index_qk_head_num, IDX_HEAD_DIM
-            )
-        else:
-            x32 = values_idx.to(tl.float32)
-            rstd = tl.rsqrt(tl.sum(x32 * x32, axis=1) / IDX_HEAD_DIM + eps).reshape(
-                idx_qk_heads_per_iter, 1
-            )
-            normalized_idx = (x32 * rstd).reshape(
-                idx_batch_size_per_iter_per_vec, index_qk_head_num, IDX_HEAD_DIM
-            )
+        x32 = values_idx.to(tl.float32)
+        rstd = tl.rsqrt(tl.sum(x32 * x32, axis=1) / IDX_HEAD_DIM + eps).reshape(
+            idx_qk_heads_per_iter, 1
+        )
+        normalized_idx = (x32 * rstd).reshape(
+            idx_batch_size_per_iter_per_vec, index_qk_head_num, IDX_HEAD_DIM
+        )
 
         # * index_q：×(1+w) + NeoX RoPE
         iq_heads = extract_slice(
@@ -526,7 +515,6 @@ def split_qkv_index_rmsnorm_rope_impl(
     indexer_out_fp8: bool = False,
     q_bias: torch.Tensor | None = None,
     k_bias: torch.Tensor | None = None,
-    skip_rmsnorm: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused split → Gemma RMSNorm → Neox RoPE（attn + indexer）。
 
@@ -626,7 +614,6 @@ def split_qkv_index_rmsnorm_rope_impl(
         index_qk_head_num,
         attn_out_fp8,
         indexer_out_fp8,
-        skip_rmsnorm,
     )
     return q_out, k_out, v_out, index_q_out, index_k_out
 
@@ -649,7 +636,6 @@ def split_qkv_index_rmsnorm_rope_impl_fake(
     indexer_out_fp8: bool = False,
     q_bias: torch.Tensor | None = None,
     k_bias: torch.Tensor | None = None,
-    skip_rmsnorm: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     batch_size = input.shape[0]
     attn_dtype = torch.float8_e4m3fn if attn_out_fp8 else input.dtype

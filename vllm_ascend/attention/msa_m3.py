@@ -1591,13 +1591,17 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             index_q = qkv.narrow(-1, main_qkv_size, self.index_q_size)
             index_k = qkv.narrow(-1, main_qkv_size + self.index_q_size, self.idx_head_dim)
 
-            # ABLATION A: RMSNorm uses C++ op (deterministic), RoPE uses Triton kernel
+            # ABLATION A: RMSNorm uses C++ op, RoPE uses Triton kernel
+            # Do RMSNorm in Python (npu_rms_norm), then pass normed data to
+            # the original fused kernel with weight=1.0 so kernel's RMSNorm
+            # becomes near-identity (data already normed, rstd≈1).
+            # This tests if the RoPE part of the fused kernel causes
+            # non-determinism, without modifying the kernel.
             q, k, v = main_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             q, k = self._qk_norm(q, k)  # npu_rms_norm (deterministic)
-            index_q, index_k = self._index_qk_norm(index_q, index_k)  # npu_rms_norm
+            index_q, index_k = self._index_qk_norm(index_q, index_k)
 
-            # Re-concat normed Q/K/V + normed index_q/k for the kernel
-            # Kernel will skip RMSNorm (skip_rmsnorm=True) and only do RoPE+clamp+cast
+            # Re-concat normed data for the kernel
             normed_input = torch.cat([
                 q.reshape(q.shape[0], -1),
                 k.reshape(k.shape[0], -1),
@@ -1606,19 +1610,20 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
                 index_k.reshape(index_k.shape[0], -1),
             ], dim=-1).contiguous()
 
-            q_weight = self.q_norm.weight_plus_one
-            k_weight = self.k_norm.weight_plus_one
-            index_q_weight = self.index_q_norm.weight_plus_one
-            index_k_weight = self.index_k_norm.weight_plus_one
+            # weight=1.0 → kernel RMSNorm does x*rstd*1.0, but since data is
+            # already normed, mean(x²)≈1, rstd≈1, so RMSNorm≈identity.
+            # The kernel's RoPE+clamp+cast is what we're testing.
+            ones_head = torch.ones(self.head_dim, dtype=torch.float32, device=qkv.device)
+            ones_idx = torch.ones(self.idx_head_dim, dtype=torch.float32, device=qkv.device)
 
             return torch.ops.vllm.qkv_index_rmsnorm_rope(
                 input=normed_input,
                 cos_sin_cache=self.rotary_emb.cos_sin_cache,
                 positions=positions,
-                q_weight=q_weight,
-                k_weight=k_weight,
-                index_q_weight=index_q_weight,
-                index_k_weight=index_k_weight,
+                q_weight=ones_head,
+                k_weight=ones_head,
+                index_q_weight=ones_idx,
+                index_k_weight=ones_idx,
                 q_hidden_size=self.q_size,
                 kv_hidden_size=self.kv_size,
                 index_q_size=self.index_q_size,
@@ -1629,7 +1634,6 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
                 indexer_out_fp8=self.indexer_kv_dtype in ("fp8", "fp8_e4m3"),
                 q_bias=None,
                 k_bias=None,
-                skip_rmsnorm=True,  # ABLATION A: skip RMSNorm in kernel
             )
 
         main_qkv_size = self.q_size + 2 * self.kv_size
