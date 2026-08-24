@@ -117,6 +117,7 @@ def split_qkv_index_rmsnorm_rope_kernel(
     HALF_CACHE: tl.constexpr,  # ROPE_DIM/2, sin starts here [unused]
     ATTN_HALF: tl.constexpr,  # main partial RoPE half width = attn_rope_dim/2
     IDX_HALF: tl.constexpr,  # indexer partial RoPE half width = idx_rope_dim/2
+    MAX_HALF: tl.constexpr,  # max(ATTN_HALF, IDX_HALF), row stride for cos/sin tensors
     num_vectorcore: tl.constexpr,  # number of Vector Cores (grid)
     batch_size_per_iter_per_vec: tl.constexpr,  # main QK loop token tile per iter
     qk_head_nums_per_iter_per_vec: tl.constexpr,  # tile * (q_head+kv_head), for reshape
@@ -176,9 +177,9 @@ def split_qkv_index_rmsnorm_rope_kernel(
 
         # Load pre-gathered cos/sin (deterministic, no scalar loop)
         cos_qk_range = tl.arange(0, ATTN_HALF)
-        cos = tl.load(cos_gm_ptr + row64[:, None] * ATTN_HALF + cos_qk_range[None, :],
+        cos = tl.load(cos_gm_ptr + row64[:, None] * MAX_HALF + cos_qk_range[None, :],
                       mask=mmask[:, None]).to(tl.float32)
-        sin = tl.load(sin_gm_ptr + row64[:, None] * ATTN_HALF + cos_qk_range[None, :],
+        sin = tl.load(sin_gm_ptr + row64[:, None] * MAX_HALF + cos_qk_range[None, :],
                       mask=mmask[:, None]).to(tl.float32)
         cos = cos.reshape(batch_size_per_iter_per_vec, 1, ATTN_HALF)
         sin = sin.reshape(batch_size_per_iter_per_vec, 1, ATTN_HALF)
@@ -339,9 +340,9 @@ def split_qkv_index_rmsnorm_rope_kernel(
 
         # Load pre-gathered cos/sin for indexer (deterministic)
         cos_idx_range = tl.arange(0, IDX_HALF)
-        cos = tl.load(cos_gm_ptr + row64[:, None] * IDX_HALF + cos_idx_range[None, :],
+        cos = tl.load(cos_gm_ptr + row64[:, None] * MAX_HALF + cos_idx_range[None, :],
                       mask=mmask[:, None]).to(tl.float32)
-        sin = tl.load(sin_gm_ptr + row64[:, None] * IDX_HALF + cos_idx_range[None, :],
+        sin = tl.load(sin_gm_ptr + row64[:, None] * MAX_HALF + cos_idx_range[None, :],
                       mask=mmask[:, None]).to(tl.float32)
         cos = cos.reshape(idx_batch_size_per_iter_per_vec, 1, IDX_HALF)
         sin = sin.reshape(idx_batch_size_per_iter_per_vec, 1, IDX_HALF)
@@ -563,6 +564,7 @@ def split_qkv_index_rmsnorm_rope_impl(
         cache_dim // 2,
         attn_rope_dim // 2,
         idx_rope_dim // 2,
+        max(attn_rope_dim // 2, idx_rope_dim // 2),
         num_vectorcore,
         int(batch_tile),
         int(batch_tile * qk_head_num_sum),
