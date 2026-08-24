@@ -100,8 +100,8 @@ def split_qkv_index_rmsnorm_rope_kernel(
     k_bias_ptr,  # main K optional bias (unused when BIAS=False)
     index_q_weight_ptr,  # indexer Q Gemma RMSNorm weight (1+w)
     index_k_weight_ptr,  # indexer K Gemma RMSNorm weight (1+w)
-    cos_gm_ptr,  # pre-gathered cos [batch, max(ATTN_HALF, IDX_HALF)]
-    sin_gm_ptr,  # pre-gathered sin [batch, max(ATTN_HALF, IDX_HALF)]
+    positions_gm_ptr,  # token positions [batch]
+    cos_sin_cache_gm_ptr,  # RoPE cache [max_pos, ROPE_DIM] = concat(cos, sin)
     batch_size,  # number of tokens
     q_hidden_size: tl.constexpr,  # q_size = q_head_num * HEAD_DIM
     kv_hidden_size: tl.constexpr,  # kv_size = kv_head_num * HEAD_DIM
@@ -174,11 +174,12 @@ def split_qkv_index_rmsnorm_rope_kernel(
             qk_head_nums_per_iter_per_vec, HEAD_DIM
         )
 
-        # Load pre-gathered cos/sin (deterministic, no scalar loop)
+        # Vectorized cos/sin load by position (deterministic, no scalar loop)
+        pos_vals = tl.load(positions_gm_ptr + row64, mask=mmask).to(tl.int64)
         cos_qk_range = tl.arange(0, ATTN_HALF)
-        cos = tl.load(cos_gm_ptr + row64[:, None] * ROPE_DIM + cos_qk_range[None, :],
+        cos = tl.load(cos_sin_cache_gm_ptr + pos_vals[:, None] * ROPE_DIM + cos_qk_range[None, :],
                       mask=mmask[:, None]).to(tl.float32)
-        sin = tl.load(sin_gm_ptr + row64[:, None] * ROPE_DIM + HALF_CACHE + cos_qk_range[None, :],
+        sin = tl.load(cos_sin_cache_gm_ptr + pos_vals[:, None] * ROPE_DIM + HALF_CACHE + cos_qk_range[None, :],
                       mask=mmask[:, None]).to(tl.float32)
         cos = cos.reshape(batch_size_per_iter_per_vec, 1, ATTN_HALF)
         sin = sin.reshape(batch_size_per_iter_per_vec, 1, ATTN_HALF)
@@ -337,11 +338,12 @@ def split_qkv_index_rmsnorm_rope_kernel(
             idx_qk_heads_per_iter, IDX_HEAD_DIM
         )
 
-        # Load pre-gathered cos/sin for indexer (deterministic)
+        # Vectorized cos/sin load by position for indexer (deterministic)
+        pos_vals = tl.load(positions_gm_ptr + row64, mask=mmask).to(tl.int64)
         cos_idx_range = tl.arange(0, IDX_HALF)
-        cos = tl.load(cos_gm_ptr + row64[:, None] * ROPE_DIM + cos_idx_range[None, :],
+        cos = tl.load(cos_sin_cache_gm_ptr + pos_vals[:, None] * ROPE_DIM + cos_idx_range[None, :],
                       mask=mmask[:, None]).to(tl.float32)
-        sin = tl.load(sin_gm_ptr + row64[:, None] * ROPE_DIM + HALF_CACHE + cos_idx_range[None, :],
+        sin = tl.load(cos_sin_cache_gm_ptr + pos_vals[:, None] * ROPE_DIM + HALF_CACHE + cos_idx_range[None, :],
                       mask=mmask[:, None]).to(tl.float32)
         cos = cos.reshape(idx_batch_size_per_iter_per_vec, 1, IDX_HALF)
         sin = sin.reshape(idx_batch_size_per_iter_per_vec, 1, IDX_HALF)
@@ -490,9 +492,7 @@ def split_qkv_index_rmsnorm_rope_impl(
     attn_rope_dim = min(cache_dim, int(head_dim))
     idx_rope_dim = min(cache_dim, int(idx_head_dim))
 
-    # Pre-gather cos/sin in Python (deterministic, avoids get_element loop in kernel)
-    # Pass entire gathered tensor; kernel reads cos from offset 0, sin from HALF_CACHE
-    cos_sin_gathered = cos_sin_cache[positions].contiguous()  # [batch, cache_dim]
+    # No Python pre-gather; kernel loads cos/sin by position vectorized (0 extra ops)
     bias = q_bias is not None
     attn_dtype = torch.float8_e4m3fn if attn_out_fp8 else input.dtype
     index_dtype = torch.float8_e4m3fn if indexer_out_fp8 else input.dtype
@@ -542,8 +542,8 @@ def split_qkv_index_rmsnorm_rope_impl(
         k_bias,
         index_q_weight,
         index_k_weight,
-        cos_sin_gathered,
-        cos_sin_gathered,
+        positions,
+        cos_sin_cache,
         batch_size,
         q_hidden_size,
         kv_hidden_size,
