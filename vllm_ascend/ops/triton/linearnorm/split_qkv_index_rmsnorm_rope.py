@@ -44,7 +44,7 @@ _UB_KB_A2 = 192
 _UB_KB_A5 = 256
 
 # FP8 E4M3 max value for clamping.
-_FP8_E4M3_MAX = 448.0
+_FP8_E4M3_MAX: tl.constexpr = 448.0
 
 
 @lru_cache(maxsize=1)
