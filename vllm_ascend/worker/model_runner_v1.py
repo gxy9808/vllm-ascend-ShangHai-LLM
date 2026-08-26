@@ -276,12 +276,19 @@ _DET_HIDDEN_BASELINE = None
 
 def _det_verify_hidden_states(hidden_states):
     global _DET_HIDDEN_CALL_COUNT, _DET_HIDDEN_BASELINE
+    import os
+    _DET_LOG = "/tmp/det_hs.log"
     _DET_HIDDEN_CALL_COUNT += 1
     call_idx = _DET_HIDDEN_CALL_COUNT
 
+    def _log(msg):
+        with open(_DET_LOG, "a") as f:
+            f.write(msg + "\n")
+            f.flush()
+
     if call_idx == 1:
         _DET_HIDDEN_BASELINE = hidden_states.clone().cpu().to(torch.float32)
-        print(f"[DET-HS] call #{call_idx}: baseline saved, shape={hidden_states.shape}, dtype={hidden_states.dtype}")
+        _log(f"[DET-HS] call #{call_idx}: baseline saved, shape={hidden_states.shape}, dtype={hidden_states.dtype}")
         return
 
     if call_idx > 4:
@@ -290,20 +297,22 @@ def _det_verify_hidden_states(hidden_states):
     cur = hidden_states.clone().cpu().to(torch.float32)
     if _DET_HIDDEN_BASELINE is not None and _DET_HIDDEN_BASELINE.shape == cur.shape:
         if torch.equal(_DET_HIDDEN_BASELINE, cur):
-            print(f"[DET-HS] call #{call_idx}: hidden_states bitwise identical")
+            _log(f"[DET-HS] call #{call_idx}: hidden_states bitwise identical")
         else:
             diff = (_DET_HIDDEN_BASELINE - cur).abs()
             n_diff = (diff > 0).sum().item()
             total = cur.numel()
             max_diff = diff.max().item()
-            print(f"[DET-HS] call #{call_idx}: hidden_states MISMATCH! "
+            _log(f"[DET-HS] call #{call_idx}: hidden_states MISMATCH! "
                   f"max_diff={max_diff:.8f}, n_diff={n_diff}/{total}")
             if n_diff > 0:
                 flat_diff = diff.flatten()
                 first_idx = (flat_diff > 0).nonzero()[0].item()
-                print(f"  first diff at flat idx {first_idx}: "
+                _log(f"  first diff at flat idx {first_idx}: "
                       f"base={_DET_HIDDEN_BASELINE.flatten()[first_idx].item():.8f}, "
                       f"cur={cur.flatten()[first_idx].item():.8f}")
+    else:
+        _log(f"[DET-HS] call #{call_idx}: shape changed, skip (base={_DET_HIDDEN_BASELINE.shape if _DET_HIDDEN_BASELINE is not None else None}, cur={cur.shape})")
 
 class NPUModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
