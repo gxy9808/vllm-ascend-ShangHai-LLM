@@ -2930,6 +2930,7 @@ class NPUModelRunner(GPUModelRunner):
                 forward_context, num_tokens_padded, positions
             )
 
+        _det_verify_hidden_states(hidden_states)
         if forward_context.flash_comm_v1_enabled and not isinstance(hidden_states, IntermediateTensors):
             hidden_states = self._all_gather_hidden_states_and_aux(hidden_states)
         return hidden_states
