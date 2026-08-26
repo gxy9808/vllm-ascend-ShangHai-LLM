@@ -47,7 +47,7 @@ _DETERMINISM_CALL_COUNT = 0
 _DETERMINISM_MAX_COMPARE = 4
 _DETERMINISM_BASELINE = {}  # saved inputs/outputs from first call
 
-@torch.compiler.disable
+@torch._dynamo.disable
 def _det_save_and_compare(tag, outputs, inputs_dict):
     global _DETERMINISM_CALL_COUNT, _DETERMINISM_BASELINE
     _DETERMINISM_CALL_COUNT += 1
@@ -1689,12 +1689,13 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
                 q_bias=None,
                 k_bias=None,
             )
-            _det_save_and_compare("fused", _fused_outputs, {
-                "qkv": qkv.contiguous(),
-                "positions": positions,
-                "q_weight": q_weight,
-                "k_weight": k_weight,
-            })
+            if not torch._dynamo.is_compiling():
+                _det_save_and_compare("fused", _fused_outputs, {
+                    "qkv": qkv.contiguous(),
+                    "positions": positions,
+                    "q_weight": q_weight,
+                    "k_weight": k_weight,
+                })
             return _fused_outputs
 
         main_qkv_size = self.q_size + 2 * self.kv_size
