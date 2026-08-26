@@ -39,6 +39,76 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+
+# ============================================================================
+# Determinism verification: compare fused kernel outputs across calls
+# ============================================================================
+_DETERMINISM_CALL_COUNT = 0
+_DETERMINISM_MAX_COMPARE = 4
+_DETERMINISM_BASELINE = {}  # saved inputs/outputs from first call
+
+def _det_save_and_compare(tag, outputs, inputs_dict):
+    global _DETERMINISM_CALL_COUNT, _DETERMINISM_BASELINE
+    _DETERMINISM_CALL_COUNT += 1
+    call_idx = _DETERMINISM_CALL_COUNT
+
+    if call_idx == 1:
+        # First call: save baseline
+        for name, tensor in inputs_dict.items():
+            _DETERMINISM_BASELINE[f"input_{name}"] = tensor.clone().cpu().to(torch.float32)
+        for i, out in enumerate(outputs):
+            _DETERMINISM_BASELINE[f"output_{i}"] = out.clone().cpu().to(torch.float32)
+        out_shapes = [('q_out', outputs[0].shape), ('k_out', outputs[1].shape),
+                       ('v_out', outputs[2].shape), ('iq_out', outputs[3].shape),
+                       ('ik_out', outputs[4].shape)]
+        print(f"[DET] {tag} call #{call_idx}: baseline saved. outputs={out_shapes}")
+        return
+
+    if call_idx > _DETERMINISM_MAX_COMPARE:
+        return
+
+    # Compare inputs
+    for name, tensor in inputs_dict.items():
+        key = f"input_{name}"
+        if key in _DETERMINISM_BASELINE:
+            base = _DETERMINISM_BASELINE[key]
+            cur = tensor.clone().cpu().to(torch.float32)
+            if not torch.equal(base, cur):
+                diff = (base - cur).abs()
+                print(f"[DET] {tag} call #{call_idx}: INPUT '{name}' MISMATCH! "
+                      f"max_diff={diff.max().item():.8f}, "
+                      f"n_diff={(diff > 0).sum().item()}")
+
+    # Compare outputs
+    names = ["q_out", "k_out", "v_out", "index_q_out", "index_k_out"]
+    all_match = True
+    for i, (name, out) in enumerate(zip(names, outputs)):
+        key = f"output_{i}"
+        if key not in _DETERMINISM_BASELINE:
+            continue
+        base = _DETERMINISM_BASELINE[key]
+        cur = out.clone().cpu().to(torch.float32)
+        if not torch.equal(base, cur):
+            diff = (base - cur).abs()
+            n_diff = (diff > 0).sum().item()
+            total = base.numel()
+            max_diff = diff.max().item()
+            print(f"[DET] {tag} call #{call_idx}: OUTPUT '{name}' MISMATCH! "
+                  f"max_diff={max_diff:.8f}, n_diff={n_diff}/{total}")
+            # Show first diff location
+            if n_diff > 0:
+                flat_diff = diff.flatten()
+                first_idx = (flat_diff > 0).nonzero()[0].item()
+                print(f"  first diff at flat idx {first_idx}: "
+                      f"base={base.flatten()[first_idx].item():.8f}, "
+                      f"cur={cur.flatten()[first_idx].item():.8f}")
+            all_match = False
+        else:
+            print(f"[DET] {tag} call #{call_idx}: OUTPUT '{name}' identical")
+
+    if all_match:
+        print(f"[DET] {tag} call #{call_idx}: all outputs bitwise identical")
+
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     FullAttentionSpec,
@@ -1599,7 +1669,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
                 index_q_weight = self.index_q_norm.weight + 1.0
             if index_k_weight is None:
                 index_k_weight = self.index_k_norm.weight + 1.0
-            return torch.ops.vllm.qkv_index_rmsnorm_rope(
+            _fused_outputs = torch.ops.vllm.qkv_index_rmsnorm_rope(
                 input=qkv.contiguous(),
                 cos_sin_cache=self.rotary_emb.cos_sin_cache,
                 positions=positions,
@@ -1618,6 +1688,13 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
                 q_bias=None,
                 k_bias=None,
             )
+            _det_save_and_compare("fused", _fused_outputs, {
+                "qkv": qkv.contiguous(),
+                "positions": positions,
+                "q_weight": q_weight,
+                "k_weight": k_weight,
+            })
+            return _fused_outputs
 
         main_qkv_size = self.q_size + 2 * self.kv_size
         main_qkv = qkv.narrow(-1, 0, main_qkv_size)
@@ -1667,6 +1744,10 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         else:
             index_q, index_k = self.rotary_emb(positions, index_q, index_k)
 
+        _det_save_and_compare("fallback", (q, k, v, index_q, index_k), {
+                "qkv": qkv.contiguous(),
+                "positions": positions,
+            })
         return q, k, v, index_q, index_k
 
     def _run_sparse_attention(
