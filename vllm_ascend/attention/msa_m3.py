@@ -47,6 +47,7 @@ _DETERMINISM_CALL_COUNT = 0
 _DETERMINISM_MAX_COMPARE = 4
 _DETERMINISM_BASELINE = {}  # saved inputs/outputs from first call
 
+@torch.compiler.disable
 def _det_save_and_compare(tag, outputs, inputs_dict):
     global _DETERMINISM_CALL_COUNT, _DETERMINISM_BASELINE
     _DETERMINISM_CALL_COUNT += 1
