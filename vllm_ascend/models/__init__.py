@@ -66,3 +66,13 @@ def register_model():
         "Glm5NextMTPModel",
         "vllm_ascend.models.glm5next.mtp:Glm5NextMTP",
     )
+    # The Ascend Step4 port overrides the CUDA/Optimus-only implementations
+    # registered by upstream vLLM under the same architecture names.
+    ModelRegistry.register_model(
+        "Step4ForCausalLM",
+        "vllm_ascend.models.step4.model:AscendStep4ForCausalLM",
+    )
+    ModelRegistry.register_model(
+        "Step4MTP",
+        "vllm_ascend.models.step4.mtp:AscendStep4MTP",
+    )

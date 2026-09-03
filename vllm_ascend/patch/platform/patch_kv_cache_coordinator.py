@@ -93,10 +93,15 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
             max_in_flight_tokens: int | None = None,
             max_num_batched_tokens: int | None = None,
             scheduler_block_size: int | None = None,
+            num_prefill_lookahead: int = 0,
         ):
             # Keep pcp_world_size in this patched constructor for compatibility
             # with the upstream coordinator interface. PCP is rejected by the platform.
             del pcp_world_size
+            # v0.27.0-based forks (e.g. vllm-step4) already pass
+            # num_prefill_lookahead; mirror the num_reprefillable_tokens
+            # semantics from upstream.
+            self.num_reprefillable_tokens = max(0, (num_prefill_lookahead or 0) - 1)
             self.dcp_world_size = dcp_world_size
             self.scheduler_block_size = scheduler_block_size
             self.kv_cache_config = kv_cache_config
@@ -522,6 +527,7 @@ if vllm_version_is("0.27.1"):
         eagle_attn_layer_names: list[str] | None = None,
         metrics_collector: KVCacheMetricsCollector | None = None,
         max_num_batched_tokens: int | None = None,
+        num_prefill_lookahead: int = 0,
     ) -> KVCacheCoordinator:
         # Keep pcp_world_size in this patched function for upstream call
         # compatibility; platform validation guarantees that it is one.
@@ -542,6 +548,7 @@ if vllm_version_is("0.27.1"):
                 max_in_flight_tokens=token_budget,
                 max_num_batched_tokens=token_budget,
                 scheduler_block_size=scheduler_block_size,
+                num_prefill_lookahead=num_prefill_lookahead,
             )
 
         if len(kv_cache_config.kv_cache_groups) == 1 or not enable_caching:
@@ -558,6 +565,7 @@ if vllm_version_is("0.27.1"):
             )
             orig_kwargs["max_in_flight_tokens"] = token_budget
             orig_kwargs["scheduler_block_size"] = scheduler_block_size
+            orig_kwargs["num_prefill_lookahead"] = num_prefill_lookahead
             return _orig_get_kv_cache_coordinator(**orig_kwargs)
 
         return AscendHybridKVCacheCoordinator(
@@ -574,6 +582,7 @@ if vllm_version_is("0.27.1"):
             max_in_flight_tokens=token_budget,
             max_num_batched_tokens=token_budget,
             scheduler_block_size=scheduler_block_size,
+            num_prefill_lookahead=num_prefill_lookahead,
         )
 
 else:
