@@ -71,6 +71,33 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Step4 (StepFun step4) model knobs. These mirror the upstream Step4 vLLM
+    # patch so the same variables configure CUDA and Ascend deployments.
+    # Whether the Step4 DSA sparse-attention path is enabled. Defaults to the
+    # checkpoint's sparse section. Not yet supported on Ascend; "0" selects
+    # the dense fallback of a DSA-capable checkpoint. Valid values: "0"/"1".
+    "VLLM_STEP4_SPARSE": lambda: os.getenv("VLLM_STEP4_SPARSE", "false").lower() in ("1", "true"),
+    # Overrides for Step4 sparse-config fields (ints). See Step4SparseConfig.
+    "VLLM_STEP4_SPARSE_PROXY_DIM": lambda: int(os.getenv("VLLM_STEP4_SPARSE_PROXY_DIM", "256")),
+    "VLLM_STEP4_SPARSE_INDEXER_ROPE_DIM": lambda: int(os.getenv("VLLM_STEP4_SPARSE_INDEXER_ROPE_DIM", "32")),
+    "VLLM_STEP4_DSA_INDEX_TP_SIZE": lambda: int(os.getenv("VLLM_STEP4_DSA_INDEX_TP_SIZE", "4")),
+    "VLLM_STEP4_SPARSE_TOPK": lambda: int(os.getenv("VLLM_STEP4_SPARSE_TOPK", "512")),
+    "VLLM_STEP4_SPARSE_REGION_BLOCK_SIZE": lambda: int(os.getenv("VLLM_STEP4_SPARSE_REGION_BLOCK_SIZE", "8")),
+    "VLLM_STEP4_SPARSE_ATTENTION_IMPL": lambda: os.getenv("VLLM_STEP4_SPARSE_ATTENTION_IMPL", "sparse_gqa"),
+    "VLLM_STEP4_SPARSE_DECODE_SPLIT_MAX": lambda: int(os.getenv("VLLM_STEP4_SPARSE_DECODE_SPLIT_MAX", "16")),
+    # Whether Step4 packs Q/K/V/gate into one column-parallel GEMM. Default false.
+    "VLLM_STEP4_ENABLE_QKVG_PROJ": lambda: os.getenv("VLLM_STEP4_ENABLE_QKVG_PROJ", "false").lower() in ("1", "true"),
+    # Whether the Step4 sparse indexer uses the fused norm+RoPE operator.
+    # Default true.
+    "VLLM_STEP4_FUSE_INDEXER_NORM": lambda: os.getenv("VLLM_STEP4_FUSE_INDEXER_NORM", "true").lower() in ("1", "true"),
+    # Whether Step4 attention o_proj uses reduce-scatter under sequence
+    # parallelism. Default false.
+    "VLLM_STEP4_O_PROJ_REDUCE_SCATTER": lambda: os.getenv(
+        "VLLM_STEP4_O_PROJ_REDUCE_SCATTER", "false"
+    ).lower() in ("1", "true"),
+    # Compute-capability knob carried over from the CUDA port; >0 forces
+    # portable operator paths. Default 0.
+    "VLLM_STEP_CC_LEVEL": lambda: int(os.getenv("VLLM_STEP_CC_LEVEL", "0")),
 }
 
 # end-env-vars-definition
