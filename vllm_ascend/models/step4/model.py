@@ -14,15 +14,15 @@ following Ascend-specific adaptations:
 - The Triton router-bias top-k kernel is replaced by a pure PyTorch
   implementation with identical semantics.
 - Routed experts run the checkpoint's FP8 e4m3 block quantization directly
-  (128x128 weight scales + dynamic per-128-group activation quantization),
-  mirroring the step4-hf reference: kernels are vendored in
-  ``fp8_kernels.py`` and experts are sharded whole (EP-style, contiguous
-  expert slices with the full inner dim) so the fp8 K-block grid stays
-  aligned. Layers listed in ``modules_to_not_convert`` keep their bf16
-  experts and take the plain bf16 path.
+  (128x128 weight scales + dynamic per-128-group activation quantization)
+  through the standard FusedMoEFactory machinery: a Step4-specific scheme
+  (``fp8_moe.py``, kernels vendored in ``fp8_kernels.py``) executes the fp8
+  block GEMMs without dequantizing or requantizing. Layers listed in
+  ``modules_to_not_convert`` keep their bf16 experts unquantized.
 """
 
 import copy
+import functools
 import typing
 from collections.abc import Callable, Iterable
 from typing import Any
@@ -69,12 +69,14 @@ from vllm.model_executor.models.utils import (
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
+    sequence_parallel_chunk,
 )
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
 
+from vllm_ascend.quantization.configs.fp8_config import AscendFp8Config, Step4Fp8BlockConfig
+
 from .dsa import AscendStep4DSAAttentionBackend
-from .fp8_kernels import linear_fp8_or_bf16
 
 logger = init_logger(__name__)
 
@@ -289,20 +291,6 @@ class FP32ReplicatedLinear(ReplicatedLinear):
         return router_logits, None
 
 
-def clamped_swiglu(gate: torch.Tensor, up: torch.Tensor, limit: float) -> torch.Tensor:
-    """``silu(gate).clamp(max=limit) * up.clamp(-limit, limit)``, in fp32.
-
-    The clamps bound the activation's magnitude so the fp8 expert GEMMs
-    downstream keep their dynamic range. The gate has no lower clamp because
-    ``silu`` already bounds it from below at about -0.28. The fp32 compute
-    with a single rounding back to bf16 matches the deployed (Triton) kernel
-    rather than a bf16-native evaluation.
-    """
-    activated = torch.nn.functional.silu(gate.float()).clamp(max=limit)
-    bounded = up.float().clamp(-limit, limit)
-    return (activated * bounded).to(gate.dtype)
-
-
 def _step4_fp8_expert_layout(config: Any) -> tuple[set[int], int]:
     """Return (bf16 expert layer indices, quant block size).
 
@@ -387,8 +375,16 @@ class Step4MLP(nn.Module):
 
 
 def _step4_moe_reduce_policy(tp_size: int, dp_size: int) -> tuple[bool, bool]:
-    """Return combined-reduce and per-path-reduce settings for Step4 MoE."""
-    fuse_all_reduce = tp_size > 1 and dp_size == 1
+    """Return combined-reduce and per-path-reduce settings for Step4 MoE.
+
+    vLLM-Ascend's MoE pipeline owns the routed output's reduction (finalize
+    reduces it under MC2-style comm, ``_maybe_reduce_final_output`` under
+    ALLGATHER), so the routed path is handed over with reduce_results=True
+    and the decoder must NOT all-reduce it again. The shared expert instead
+    returns an unreduced partial that the decoder reduces in fp32, matching
+    the reference's shared-expert precision (bf16 partial, fp32 collective).
+    """
+    fuse_all_reduce = False
     return fuse_all_reduce, not fuse_all_reduce
 
 
@@ -825,245 +821,16 @@ class Step4Attention(nn.Module):
         return output
 
 
-class Step4StackedExpertWeight(nn.Module):
-    """One ``[n_local_experts, out, in]`` weight plus its fp8 block scale.
-
-    Follows the step4-hf reference layout: experts are sharded *whole*
-    (EP-style contiguous expert slices with the full inner dim), never along
-    the inner dim -- that is the only layout under which the fp8 block
-    scale's K-block grid (``ceil(in_features / 128)``) stays aligned with
-    the GEMM's K-iters. Slicing the inner dim would put a single K-iter
-    across a weight-block boundary and break the block-scaling assumption.
-
-    ``weight_scale_inv`` exists only for fp8 layers; its presence (not the
-    layer index) selects the fp8 GEMM path, so a checkpoint can graduate a
-    layer off the not-convert list without code changes.
-    """
-
-    def __init__(
-        self,
-        num_global_experts: int,
-        experts_start_idx: int,
-        n_local_experts: int,
-        out_features: int,
-        in_features: int,
-        *,
-        quantized: bool,
-        block: int = 128,
-    ) -> None:
-        super().__init__()
-        self.num_global_experts = num_global_experts
-        self.experts_start_idx = experts_start_idx
-        self.n_local_experts = n_local_experts
-        self.block = block
-        weight_dtype = torch.float8_e4m3fn if quantized else torch.bfloat16
-        self.weight = nn.Parameter(
-            torch.empty(n_local_experts, out_features, in_features, dtype=weight_dtype),
-            requires_grad=False,
-        )
-        self.weight.weight_loader = self._weight_loader
-        if quantized:
-            self.weight_scale_inv = nn.Parameter(
-                torch.empty(
-                    n_local_experts,
-                    -(-out_features // block),
-                    -(-in_features // block),
-                    dtype=torch.float32,
-                ),
-                requires_grad=False,
-            )
-            self.weight_scale_inv.weight_loader = self._weight_loader
-        else:
-            self.weight_scale_inv = None
-
-    def _weight_loader(
-        self,
-        param: torch.nn.Parameter,
-        loaded_weight: torch.Tensor,
-        loaded_name: str | None = None,
-        *,
-        shard_id: Any = None,
-        expert_id: int | None = None,
-    ) -> None:
-        del loaded_name, shard_id
-        n_local = param.shape[0]
-        if loaded_weight.dim() == param.dim() - 1 and expert_id is not None:
-            global_idx = int(expert_id)
-            if not (
-                self.experts_start_idx
-                <= global_idx
-                < self.experts_start_idx + n_local
-            ):
-                return
-            piece = loaded_weight.unsqueeze(0)
-            target = slice(global_idx - self.experts_start_idx, global_idx - self.experts_start_idx + 1)
-        else:
-            total = loaded_weight.shape[0]
-            if total == 1 and n_local != 1:
-                piece = loaded_weight
-                target = slice(None)
-            elif total == self.num_global_experts:
-                if n_local == self.num_global_experts:
-                    piece = loaded_weight
-                    target = slice(None)
-                else:
-                    piece = loaded_weight[
-                        self.experts_start_idx : self.experts_start_idx + n_local
-                    ]
-                    target = slice(None)
-            else:
-                raise ValueError(
-                    "Step4 expert tensor has an unexpected leading dimension: "
-                    f"expected {self.num_global_experts} (or a broadcastable "
-                    f"1), got {total}."
-                )
-        with torch.no_grad():
-            if target == slice(None):
-                param.data.copy_(piece.to(param.dtype).expand_as(param.data))
-            else:
-                param.data[target].copy_(piece.to(param.dtype))
-
-    def apply_expert(
-        self, expert_idx: int, hidden_states: torch.Tensor
-    ) -> torch.Tensor:
-        """``y = x @ w.T`` over this expert's full inner dim (fp8 or bf16)."""
-        scale = (
-            None
-            if self.weight_scale_inv is None
-            else self.weight_scale_inv[expert_idx]
-        )
-        return linear_fp8_or_bf16(hidden_states, self.weight[expert_idx], scale)
-
-
-class Step4Experts(nn.Module):
-    """Routed experts with step4-hf arithmetic.
-
-    Sigmoid+bias router top-k (eager, parity-checked), per-expert grouped
-    fp8 block GEMMs with clamped SwiGLU between the two projections, and a
-    top-k *slot*-order fp32 accumulation of the weighted contributions --
-    the deployed ``ep_gather`` order, kept so the rounding sequence matches
-    the reference. Experts are sharded whole across the TP group (co-located
-    EP semantics): each rank contributes only its local experts' slots and
-    the partial result is completed by the decoder layer's fp32 all-reduce.
-    """
-
-    def __init__(
-        self,
-        config: Any,
-        layer_idx: int,
-        *,
-        bf16_expert_layers: set[int],
-        tp_rank: int,
-        tp_size: int,
-        quant_block: int,
-    ) -> None:
-        super().__init__()
-        self.top_k = config.moe_top_k
-        self.renormalize = config.norm_expert_weight
-        self.routed_scaling_factor = config.moe_router_scaling_factor
-        swiglu_limits = config.swiglu_limits or []
-        self.swiglu_limit = (
-            float(swiglu_limits[layer_idx])
-            if layer_idx < len(swiglu_limits)
-            else None
-        )
-
-        n_routed = config.moe_num_experts
-        if n_routed % tp_size:
-            raise ValueError(
-                f"Step4 has {n_routed} routed experts, not divisible by "
-                f"TP size {tp_size}."
-            )
-        self.n_local_experts = n_routed // tp_size
-        self.experts_start_idx = tp_rank * self.n_local_experts
-        quantized = layer_idx not in bf16_expert_layers
-        self.gate_proj = Step4StackedExpertWeight(
-            n_routed,
-            self.experts_start_idx,
-            self.n_local_experts,
-            config.moe_intermediate_size,
-            config.hidden_size,
-            quantized=quantized,
-            block=quant_block,
-        )
-        self.up_proj = Step4StackedExpertWeight(
-            n_routed,
-            self.experts_start_idx,
-            self.n_local_experts,
-            config.moe_intermediate_size,
-            config.hidden_size,
-            quantized=quantized,
-            block=quant_block,
-        )
-        self.down_proj = Step4StackedExpertWeight(
-            n_routed,
-            self.experts_start_idx,
-            self.n_local_experts,
-            config.hidden_size,
-            config.moe_intermediate_size,
-            quantized=quantized,
-            block=quant_block,
-        )
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        router_logits: torch.Tensor,
-        router_bias: torch.Tensor,
-    ) -> torch.Tensor:
-        topk_weights, topk_ids = step4_router_bias_eager(
-            None,
-            router_logits,
-            self.top_k,
-            self.renormalize,
-            router_bias=router_bias,
-            routed_scaling_factor=self.routed_scaling_factor,
-        )
-        num_tokens, hidden_dim = hidden_states.shape
-        limit = self.swiglu_limit
-        slot_output = torch.zeros(
-            num_tokens,
-            self.top_k,
-            hidden_dim,
-            dtype=torch.bfloat16,
-            device=hidden_states.device,
-        )
-        for local in range(self.n_local_experts):
-            global_idx = self.experts_start_idx + local
-            rows, slots = (topk_ids == global_idx).nonzero(as_tuple=True)
-            if rows.numel() == 0:
-                continue
-            tokens = hidden_states[rows]
-            gate_out = self.gate_proj.apply_expert(local, tokens)
-            up_out = self.up_proj.apply_expert(local, tokens)
-            if limit is None:
-                activated = torch.nn.functional.silu(gate_out.float()) * up_out.float()
-                activated = activated.to(gate_out.dtype)
-            else:
-                activated = clamped_swiglu(gate_out, up_out, limit)
-            contribution = self.down_proj.apply_expert(local, activated)
-            slot_output[rows, slots] = contribution.to(torch.bfloat16)
-
-        accumulator = torch.zeros(
-            num_tokens, hidden_dim, dtype=torch.float32, device=hidden_states.device
-        )
-        for slot in range(self.top_k):
-            accumulator += (
-                slot_output[:, slot].float() * topk_weights[:, slot].unsqueeze(-1)
-            )
-        return accumulator.to(torch.bfloat16)
-
-
-class Step4MoEBlock(nn.Module):
+class FusedMoEBlock(nn.Module):
     def __init__(
         self,
         vllm_config: VllmConfig,
         prefix: str = "",
     ):
         super().__init__()
+        from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 
         self.tp_size = get_tensor_model_parallel_world_size()
-        self.tp_rank = get_tensor_model_parallel_rank()
         self.layer_idx = extract_layer_index(prefix)
 
         parallel_config = vllm_config.parallel_config
@@ -1078,18 +845,6 @@ class Step4MoEBlock(nn.Module):
         self.n_local_physical_experts = self.n_physical_experts // max(
             self.tp_size, 1
         )
-        if self.enable_eplb:
-            raise NotImplementedError(
-                "Step4 Ascend fp8 experts do not support EPLB: whole-expert "
-                "sharding has no physical/logical expert remapping."
-            )
-        if (
-            vllm_config.compilation_config.pass_config.enable_sp
-            and self.tp_size > 1
-        ):
-            raise NotImplementedError(
-                "Step4 Ascend fp8 experts do not support sequence parallel."
-            )
 
         if self.tp_size > config.moe_num_experts:
             raise ValueError(
@@ -1118,6 +873,7 @@ class Step4MoEBlock(nn.Module):
                 "Step4 MoE requires need_fp32_gate=true for stable router logits."
             )
 
+        activation = "silu"
         swiglu_limits = config.swiglu_limits or []
         swiglu_limit = (
             swiglu_limits[self.layer_idx]
@@ -1131,55 +887,131 @@ class Step4MoEBlock(nn.Module):
                     "Step4 fused MoE supports only swiglu_limit=7.0, got "
                     f"{swiglu_limit}."
                 )
-        del swiglu_limit  # enforced in Step4Experts via config
+            activation = "swiglustep"
 
-        bf16_expert_layers, quant_block = _step4_fp8_expert_layout(config)
+        # Routed experts run the checkpoint's native fp8 block quantization
+        # through the standard FusedMoE machinery (weights/scales/activation
+        # and reduce policy are the framework's; only the fp8 execution is
+        # Step4-specific). Layers the checkpoint left in bf16
+        # (modules_to_not_convert) stay unquantized.
+        bf16_expert_layers, _ = _step4_fp8_expert_layout(config)
+        quant_config = vllm_config.quant_config
+        if self.layer_idx in bf16_expert_layers:
+            moe_quant_config = None
+        elif isinstance(quant_config, AscendFp8Config):
+            # Shallow copy re-bound to the Step4 config so the framework's
+            # fp8-block parsing is preserved while the MoE route changes.
+            step4_config = copy.copy(quant_config)
+            step4_config.__class__ = Step4Fp8BlockConfig
+            moe_quant_config = step4_config
+        else:
+            moe_quant_config = quant_config
 
+        # router_bias is loaded in place, making the captured Parameter stable.
+        custom_routing_function = functools.partial(
+            step4_router_bias_eager,
+            router_bias=self.router_bias,
+            routed_scaling_factor=config.moe_router_scaling_factor,
+        )
         self.fuse_all_reduce, reduce_results = _step4_moe_reduce_policy(
             self.tp_size,
             get_dp_group().world_size,
         )
+        effective_sequence_parallel = (
+            vllm_config.compilation_config.pass_config.enable_sp and self.tp_size > 1
+        )
 
+        # The shared expert always returns an unreduced partial; the decoder
+        # layer reduces it in fp32 alongside the (already reduced) routed
+        # output, mirroring the reference's collective precision. The routed
+        # path keeps the policy's reduce_results=True (reduced by the MoE
+        # pipeline itself).
         self.share_expert = Step4MLP(
             config=config,
             hidden_size=self.hidden_size,
             intermediate_size=config.share_expert_dim,
             hidden_act="silu",
-            reduce_results=reduce_results,
+            reduce_results=False,
+            is_sequence_parallel=effective_sequence_parallel,
             prefix=f"{prefix}.share_expert",
         )
-        self.experts = Step4Experts(
-            config,
-            self.layer_idx,
-            bf16_expert_layers=bf16_expert_layers,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
-            quant_block=quant_block,
+        # Keep the shared expert outside FusedMoEFactory so Step4 can combine
+        # shared and routed outputs in FP32 before the final all-reduce.
+        self.experts = FusedMoEFactory(
+            num_experts=config.moe_num_experts,
+            top_k=config.moe_top_k,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            reduce_results=reduce_results,
+            renormalize=config.norm_expert_weight,
+            quant_config=moe_quant_config,
+            activation=activation,
+            prefix=f"{prefix}.experts",
+            e_score_correction_bias=self.router_bias,
+            routed_scaling_factor=config.moe_router_scaling_factor,
+            enable_eplb=self.enable_eplb,
+            num_redundant_experts=self.n_redundant_experts,
+            is_sequence_parallel=effective_sequence_parallel,
+            router_logits_dtype=torch.float32,
+            custom_routing_function=custom_routing_function,
         )
+        self._bind_scheme_router()
+
+    def _bind_scheme_router(self) -> None:
+        """Give the fp8 scheme the fp32 router references.
+
+        The framework's router narrows topk_weights to bf16; the scheme
+        recomputes them in fp32 from the gate weight + bias, which needs
+        these bindings.
+        """
+        from vllm_ascend.quantization.methods.w8a8.fp8_block import (
+            Step4Fp8BlockFusedMoEMethod,
+        )
+
+        def _find(obj: Any, depth: int = 0) -> Step4Fp8BlockFusedMoEMethod | None:
+            if depth > 5:
+                return None
+            if isinstance(obj, Step4Fp8BlockFusedMoEMethod):
+                return obj
+            for attr in ("routed_experts", "experts", "layer", "quant_method"):
+                child = getattr(obj, attr, None)
+                if child is not None and child is not obj:
+                    found = _find(child, depth + 1)
+                    if found is not None:
+                        return found
+            return None
+
+        scheme = _find(self.experts)
+        if scheme is not None:
+            scheme.bind_router(
+                self.gate.weight,
+                self.router_bias,
+                self.routed_scaling_factor,
+            )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         input_is_sequence_parallel: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if input_is_sequence_parallel:
-            raise NotImplementedError(
-                "Step4 Ascend fp8 experts do not support sequence parallel."
-            )
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
+        # Sequence-parallel state is carried by the runner's FusedMoEConfig.
+        if (
+            self.experts.moe_config.is_sequence_parallel
+            and not input_is_sequence_parallel
+        ):
+            hidden_states = sequence_parallel_chunk(hidden_states)
 
         shared_output = self.share_expert(hidden_states)
 
         router_logits, _ = self.gate(hidden_states)
         routed_output = self.experts(
-            hidden_states, router_logits, self.router_bias
+            hidden_states=hidden_states, router_logits=router_logits
         )
 
         # Kept separate so _forward_ffn can combine in fp32 and all-reduce after.
         return shared_output, routed_output
-
-
 
 class Step4DecoderLayer(nn.Module):
     def __init__(
@@ -1302,7 +1134,7 @@ class Step4DecoderLayer(nn.Module):
 
         moe_layers_idx = _get_step4_moe_layer_indices(config)
         if layer_idx in moe_layers_idx:
-            self.moe = Step4MoEBlock(
+            self.moe = FusedMoEBlock(
                 vllm_config,
                 prefix=f"{prefix}.moe",
             )
@@ -1357,24 +1189,15 @@ class Step4DecoderLayer(nn.Module):
             shared_output, moe_output = self.moe(
                 hidden_states, input_is_sequence_parallel=input_is_sequence_parallel
             )
-            # Combine shared and routed expert outputs in fp32.
-            combined = self._cast_for_residual(moe_output) + self._cast_for_residual(
-                shared_output
-            )
-            # When fuse_all_reduce=True, the runner does NOT
-            # all-reduce (reduce_results=False), so we must all-reduce
-            # the combined output here. When fuse_all_reduce=False,
-            # routed output is either already reduced by the combine kernel or
-            # reduced by _maybe_reduce_output. The shared expert path is a
-            # separate RowParallelLinear, so DP/EP paths configure it to reduce
-            # internally before it is combined with routed output.
-            if self.moe.fuse_all_reduce:
-                if self.use_fused_all_reduce:
-                    combined = self.tp_group.all_reduce(combined)
-                else:
-                    combined = tensor_model_parallel_all_reduce(combined)
-                return combined
-            return combined
+            # The routed output arrives already reduced by the MoE pipeline
+            # (finalize / _maybe_reduce_final_output). The shared expert is an
+            # unreduced partial: reduce it here in fp32 -- the collective
+            # precision the reference uses -- and combine.
+            combined = self._cast_for_residual(moe_output)
+            shared = self._cast_for_residual(shared_output)
+            if self.moe.tp_size > 1:
+                shared = tensor_model_parallel_all_reduce(shared)
+            return combined + shared
         return self.mlp(hidden_states)
 
     def forward(
@@ -1398,14 +1221,6 @@ class Step4DecoderLayer(nn.Module):
         ffn_output = self._cast_for_residual(ffn_output)
         hidden_states = ffn_output + residual
         return hidden_states
-
-
-def _is_fp8_weight(name: str, tensor: torch.Tensor) -> bool:
-    return name.endswith(".weight") and tensor.dtype in FP8_DTYPES
-
-
-def _is_fp8_scale(name: str) -> bool:
-    return name.endswith(".weight_scale_inv")
 
 
 # ---------------------------------------------------------------------------
@@ -1596,23 +1411,43 @@ class Step4Model(nn.Module):
         params_dict: dict[str, torch.nn.Parameter],
         loaded_params: set[str],
     ) -> bool:
-        """Load one 3D packed expert tensor (weight or block scale) raw.
+        """Load one 3D packed expert tensor (fp8/bf16 weight or block scale).
 
-        The expert parameters slice their global-expert dim themselves inside
-        their ``weight_loader``, so no dequantization or per-expert loop is
-        needed here.
+        The mapping's ``weight_prefix`` is a substring of both the weight name
+        and the scale name, so one replace maps ``moe.gate_proj.weight`` and
+        ``moe.gate_proj.weight_scale_inv`` onto the FusedMoE params. The
+        checkpoint stacks all experts on dim 0; the loop delegates one expert
+        slice at a time to the framework's block-aware expert weight_loader.
         """
-        for param_prefix, weight_prefix in self.expert_params_mapping:
-            if weight_prefix not in local_name:
+        for param_name, weight_name, shard_id in self.expert_params_mapping:
+            if weight_name not in local_name:
                 continue
-            replaced_name = local_name.replace(weight_prefix, param_prefix)
+            replaced_name = local_name.replace(weight_name, param_name)
             if is_pp_missing_parameter(replaced_name, self):
                 return True
             if replaced_name not in params_dict:
                 return True
             param = params_dict[replaced_name]
             weight_loader = param.weight_loader
-            weight_loader(param, loaded_weight)
+            moe_expert_num = self.config.moe_num_experts
+            if loaded_weight.ndim == 0:
+                loaded_weight = loaded_weight.unsqueeze(0).expand(moe_expert_num)
+            elif loaded_weight.shape[0] == 1 and loaded_weight.shape[0] != (
+                moe_expert_num
+            ):
+                loaded_weight = loaded_weight.expand(
+                    moe_expert_num, *loaded_weight.shape[1:]
+                )
+            assert loaded_weight.shape[0] == moe_expert_num
+            for expert_id in range(moe_expert_num):
+                weight_loader(
+                    param,
+                    loaded_weight[expert_id],
+                    replaced_name,
+                    shard_id=shard_id,
+                    expert_id=expert_id,
+                    return_success=True,
+                )
             loaded_params.add(replaced_name)
             return True
         return False
@@ -1639,36 +1474,29 @@ class Step4Model(nn.Module):
         ]
 
         params_dict = dict(self.named_parameters())
-        # Routed experts live under ``moe.experts.{gate,up,down}_proj``; the
-        # checkpoint stores them as direct children of ``moe``.
+        # Routed experts live under ``moe.experts`` (FusedMoE w13/w2 params,
+        # possibly behind routed_experts/base_layer nesting); the checkpoint
+        # stores them stacked on dim 0 as direct children of ``moe``. The
+        # weight_name substrings match both the fp8 weight and its
+        # ``weight_scale_inv`` in one replace.
+        base_layer = (
+            "base_layer." if any(".base_layer." in name for name in params_dict) else ""
+        )
+        routed_experts = (
+            "routed_experts."
+            if any(".experts.routed_experts." in name for name in params_dict)
+            else ""
+        )
+        expert_prefix = f".moe.experts.{routed_experts}{base_layer}"
         self.expert_params_mapping = [
-            (".moe.experts.gate_proj.", ".moe.gate_proj."),
-            (".moe.experts.up_proj.", ".moe.up_proj."),
-            (".moe.experts.down_proj.", ".moe.down_proj."),
+            # (param_name, weight_name, shard_id)
+            (f"{expert_prefix}w13_weight", ".moe.gate_proj.weight", "w1"),
+            (f"{expert_prefix}w13_weight", ".moe.up_proj.weight", "w3"),
+            (f"{expert_prefix}w2_weight", ".moe.down_proj.weight", "w2"),
         ]
         disable_moe_stacked_params = [data[1] for data in self.expert_params_mapping]
 
         loaded_params: set[str] = set()
-        # FP8 weights arrive as separate weight / weight_scale_inv entries;
-        # buffer both halves and load them raw once the pair is complete.
-        pending_fp8: dict[str, dict[str, torch.Tensor]] = {}
-
-        def _flush_fp8_pair(key: str) -> None:
-            entry = pending_fp8.pop(key)
-            if not self._load_expert_tensor(
-                f"{key}.weight", entry["weight"], params_dict, loaded_params
-            ):
-                raise ValueError(
-                    f"Step4 FP8 weight {key}.weight does not match any expert "
-                    "parameter mapping."
-                )
-            if not self._load_expert_tensor(
-                f"{key}.weight_scale_inv", entry["scale"], params_dict, loaded_params
-            ):
-                raise ValueError(
-                    f"Step4 FP8 scale {key}.weight_scale_inv does not match "
-                    "any expert parameter mapping."
-                )
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
@@ -1695,18 +1523,6 @@ class Step4Model(nn.Module):
 
             # DSA sparse-indexer weights have no consumer in the dense fallback.
             if any(marker in local_name for marker in _DSA_ONLY_WEIGHT_MARKERS):
-                continue
-
-            if _is_fp8_weight(local_name, loaded_weight) or _is_fp8_scale(local_name):
-                key = local_name[: -len(".weight_scale_inv")] if _is_fp8_scale(
-                    local_name
-                ) else local_name[: -len(".weight")]
-                entry = pending_fp8.setdefault(key, {})
-                entry["scale" if _is_fp8_scale(local_name) else "weight"] = (
-                    loaded_weight
-                )
-                if "weight" in entry and "scale" in entry:
-                    _flush_fp8_pair(key)
                 continue
 
             remapped_name = maybe_remap_kv_scale_name(local_name, params_dict)
@@ -1751,11 +1567,6 @@ class Step4Model(nn.Module):
             weight_loader(param, loaded_weight)
             loaded_params.add(local_name)
 
-        if pending_fp8:
-            raise RuntimeError(
-                "Step4 FP8 weights are missing their weight_scale_inv pair: "
-                f"{sorted(pending_fp8)}"
-            )
         return loaded_params
 
 
@@ -1784,8 +1595,8 @@ class AscendStep4ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
             logger.info_once(
                 "Step4 checkpoint declares quantization_config; the Ascend "
                 "port runs routed experts directly in fp8 (128x128 block "
-                "scales, dynamic activation quantization), mirroring the "
-                "step4-hf reference."
+                "scales, dynamic activation quantization) via the Step4 "
+                "FusedMoE scheme, mirroring the step4-hf reference."
             )
         self.model = Step4Model(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
@@ -1812,12 +1623,12 @@ class AscendStep4ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
 
         # Set MoE hyperparameters
         self.moe_layers: list[Any] = []
-        example_layer: Step4MoEBlock | None = None
+        example_layer: FusedMoEBlock | None = None
         for layer in self.model.layers:
             if isinstance(layer, PPMissingLayer):
                 continue
             assert isinstance(layer, Step4DecoderLayer)
-            if hasattr(layer, "moe") and isinstance(layer.moe, Step4MoEBlock):
+            if hasattr(layer, "moe") and isinstance(layer.moe, FusedMoEBlock):
                 example_layer = layer.moe
                 self.moe_layers.append(layer.moe.experts)
 
@@ -1865,11 +1676,12 @@ class AscendStep4ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
             if not isinstance(layer, Step4DecoderLayer):
                 continue
             moe = getattr(layer, "moe", None)
-            if not isinstance(moe, Step4MoEBlock):
+            if not isinstance(moe, FusedMoEBlock):
                 continue
             moe.n_local_physical_experts = num_local_physical_experts
             moe.n_physical_experts = num_physical_experts
             moe.n_redundant_experts = self.num_redundant_experts
+            moe.experts.update_expert_map()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         skip_prefixes = ["vision_model."]

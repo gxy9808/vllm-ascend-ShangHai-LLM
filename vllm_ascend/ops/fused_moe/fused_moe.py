@@ -199,7 +199,19 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
     ) -> torch.Tensor:
         if output_is_reduced is None:
             output_is_reduced = self._fused_output_is_reduced
-        if not output_is_reduced and not self.moe_config.is_sequence_parallel:
+        if self.moe_config.skip_final_all_reduce:
+            # The model requested a deferred all-reduce (reduce_results=False)
+            # and will reduce the combined shared+routed sum itself; mirror
+            # the upstream gate so the request is honored.
+            assert not output_is_reduced, (
+                "skip_final_all_reduce requires an un-reduced fused output"
+            )
+
+        if (
+            not self.moe_config.is_sequence_parallel
+            and not self.moe_config.skip_final_all_reduce
+            and not output_is_reduced
+        ):
             # Use the normal TP collective when the upstream reduction
             # contract requires it. Sequence-parallel outputs are token
             # shards, so reducing them position-wise would corrupt the result.

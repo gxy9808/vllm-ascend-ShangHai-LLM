@@ -32,12 +32,10 @@ from vllm.sequence import IntermediateTensors
 
 from .model import (
     _DSA_ONLY_WEIGHT_MARKERS,
-    _is_fp8_scale,
-    _is_fp8_weight,
     _require_resolved_valid_vocab_size,
     _set_step4_moe_protocol_metadata,
+    FusedMoEBlock,
     Step4DecoderLayer,
-    Step4MoEBlock,
     Step4RMSNorm,
     get_norm_dtype,
 )
@@ -221,12 +219,12 @@ class Step4MultiTokenPredictor(nn.Module):
 
 def _get_step4_mtp_moe_blocks(
     model: Step4MultiTokenPredictor,
-) -> list[Step4MoEBlock]:
-    blocks: list[Step4MoEBlock] = []
+) -> list[FusedMoEBlock]:
+    blocks: list[FusedMoEBlock] = []
     for predictor_layer in model.layers.values():
         mtp_block = getattr(predictor_layer, "mtp_block", None)
         moe = getattr(mtp_block, "moe", None)
-        if isinstance(moe, Step4MoEBlock):
+        if isinstance(moe, FusedMoEBlock):
             blocks.append(moe)
     return blocks
 
@@ -317,27 +315,61 @@ class AscendStep4MTP(nn.Module, MixtureOfExperts):
             ("gate_up_proj", "up_proj", 1),
         ]
         params_dict = dict(self.named_parameters())
+        base_layer = (
+            "base_layer." if any(".base_layer." in name for name in params_dict) else ""
+        )
+        routed_experts = (
+            "routed_experts."
+            if any(".experts.routed_experts." in name for name in params_dict)
+            else ""
+        )
+        expert_prefix = f".moe.experts.{routed_experts}{base_layer}"
         expert_params_mapping = [
-            (".moe.experts.gate_proj.", ".moe.gate_proj."),
-            (".moe.experts.up_proj.", ".moe.up_proj."),
-            (".moe.experts.down_proj.", ".moe.down_proj."),
+            # (param_name, weight_name, shard_id); the weight_name substrings
+            # also match the fp8 ``weight_scale_inv`` names in one replace.
+            (f"{expert_prefix}w13_weight", ".moe.gate_proj.weight", "w1"),
+            (f"{expert_prefix}w13_weight", ".moe.up_proj.weight", "w3"),
+            (f"{expert_prefix}w2_weight", ".moe.down_proj.weight", "w2"),
         ]
 
         def _load_expert_tensor(name: str, loaded_weight: torch.Tensor) -> bool:
-            for param_prefix, weight_prefix in expert_params_mapping:
-                if weight_prefix not in name:
+            for param_name, weight_name, shard_id in expert_params_mapping:
+                if weight_name not in name:
                     continue
-                replaced_name = name.replace(weight_prefix, param_prefix)
+                replaced_name = name.replace(weight_name, param_name)
                 if replaced_name not in params_dict:
                     return True
                 param = params_dict[replaced_name]
-                param.weight_loader(param, loaded_weight)
+                moe_expert_num = self.config.moe_num_experts
+                if loaded_weight.ndim == 0:
+                    loaded_weight = loaded_weight.unsqueeze(0).expand(moe_expert_num)
+                elif (
+                    loaded_weight.shape[0] == 1
+                    and loaded_weight.shape[0] != moe_expert_num
+                ):
+                    loaded_weight = loaded_weight.expand(
+                        moe_expert_num, *loaded_weight.shape[1:]
+                    )
+                if loaded_weight.shape[0] != moe_expert_num:
+                    raise ValueError(
+                        "Step4 MTP expert tensor has an unexpected leading "
+                        f"dimension: expected {moe_expert_num}, got "
+                        f"{loaded_weight.shape[0]} for {replaced_name}."
+                    )
+                for expert_id in range(moe_expert_num):
+                    param.weight_loader(
+                        param,
+                        loaded_weight[expert_id],
+                        replaced_name,
+                        shard_id=shard_id,
+                        expert_id=expert_id,
+                        return_success=True,
+                    )
                 loaded_params.add(replaced_name)
                 return True
             return False
 
         loaded_params: set[str] = set()
-        pending_fp8: dict[str, dict[str, torch.Tensor]] = {}
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -349,30 +381,6 @@ class AscendStep4MTP(nn.Module, MixtureOfExperts):
             name = self._rewrite_spec_layer_name(spec_layer, name)
             # DSA sparse-indexer weights have no consumer in the dense fallback.
             if any(marker in name for marker in _DSA_ONLY_WEIGHT_MARKERS):
-                continue
-
-            if _is_fp8_weight(name, loaded_weight) or _is_fp8_scale(name):
-                key = (
-                    name[: -len(".weight_scale_inv")]
-                    if _is_fp8_scale(name)
-                    else name[: -len(".weight")]
-                )
-                entry = pending_fp8.setdefault(key, {})
-                entry["scale" if _is_fp8_scale(name) else "weight"] = loaded_weight
-                if "weight" in entry and "scale" in entry:
-                    del pending_fp8[key]
-                    if not _load_expert_tensor(f"{key}.weight", entry["weight"]):
-                        raise ValueError(
-                            f"Step4 MTP FP8 weight {key}.weight does not match "
-                            "any expert parameter mapping."
-                        )
-                    if not _load_expert_tensor(
-                        f"{key}.weight_scale_inv", entry["scale"]
-                    ):
-                        raise ValueError(
-                            f"Step4 MTP FP8 scale {key}.weight_scale_inv does "
-                            "not match any expert parameter mapping."
-                        )
                 continue
 
             loaded = False
