@@ -80,6 +80,7 @@ from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionType
 
 from . import envs as step4_envs
+from .dsa import Step4DSACore
 from .kernels import (
     fused_qknorm_rope_forward_impl,
     get_step4_sparse_config,
@@ -88,13 +89,6 @@ from .kernels import (
 from .layernorm import OptimusRMSNorm
 
 logger = init_logger(__name__)
-
-_DSA_UNSUPPORTED_MSG = (
-    "Step4 DSA sparse attention is not yet supported on Ascend: the CUDA "
-    "port backs it with SM90 CuTeDSL kernels. Set VLLM_STEP4_SPARSE=0 to "
-    "run the dense fallback of this checkpoint (full attention on every "
-    "layer, indexer weights ignored), or use a native dense Step4 variant."
-)
 
 
 def step4_materialize_gate_input(tensor: torch.Tensor) -> torch.Tensor:
@@ -444,6 +438,7 @@ class Step4Attention(nn.Module):
         zero_centered: bool = True,
         vllm_config: VllmConfig | None = None,
         norm_dtype: torch.dtype | None = None,
+        sparse_config=None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -648,17 +643,45 @@ class Step4Attention(nn.Module):
             )
         )
 
-        self.attn = Attention(
-            self.num_heads,
-            self.head_dim,
-            self.scaling,
-            num_kv_heads=self.num_kv_heads,
-            cache_config=cache_config,
-            quant_config=quant_config,
-            prefix=f"{prefix}.attn",
-            per_layer_sliding_window=sliding_window,
-            attn_type=attn_type,
-        )
+        # DSA sparse attention applies to full-attention layers of a
+        # DSA-capable checkpoint (apply_to_layer_types is validated to be
+        # exactly ("full_attention",) at sparse-config parse time).
+        self.sparse_config = sparse_config if sliding_window is None else None
+        self.dsa_core: Step4DSACore | None = None
+        if self.sparse_config is not None:
+            if vllm_config is None:
+                raise ValueError("Step4 DSA requires a complete VllmConfig.")
+            self.dsa_core = Step4DSACore(
+                vllm_config=vllm_config,
+                sparse_config=self.sparse_config,
+                prefix=prefix,
+                num_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+                hidden_size=hidden_size,
+                rms_norm_eps=rms_norm_eps,
+                indexer_rope_parameters=rope_parameters,
+                indexer_rope_theta=self.rope_theta,
+                max_position=max_position,
+                dtype=self.params_dtype,
+                topk=int(self.sparse_config.topk),
+                ssmax_s_size=self.total_num_heads,
+                proxy_dim=int(self.sparse_config.proxy_dim),
+                rope_dim=int(self.sparse_config.sparse_indexer_rope_dim),
+                region_size=int(self.sparse_config.region_block_size),
+            )
+        else:
+            self.attn = Attention(
+                self.num_heads,
+                self.head_dim,
+                self.scaling,
+                num_kv_heads=self.num_kv_heads,
+                cache_config=cache_config,
+                quant_config=quant_config,
+                prefix=f"{prefix}.attn",
+                per_layer_sliding_window=sliding_window,
+                attn_type=attn_type,
+            )
         self.max_position_embeddings = max_position
 
         self.rotary_cache = self.rotary_emb.cos_sin_cache
@@ -717,7 +740,10 @@ class Step4Attention(nn.Module):
             if self.use_rope:
                 q, k = self.rotary_emb(positions, q, k)
 
-        attn_output = self.attn(q, k, v)
+        if self.dsa_core is not None:
+            attn_output = self.dsa_core(positions, hidden_states, q, k, v)
+        else:
+            attn_output = self.attn(q, k, v)
         if extra_dims is None and self.use_head_wise_attn_gate:
             extra_dims, _ = self.g_proj(hidden_states)
 
@@ -935,8 +961,9 @@ class Step4DecoderLayer(nn.Module):
         if cache_config is not None:
             cache_config = copy.copy(cache_config)
             cache_config.sliding_window = None
-        if get_step4_sparse_config(config) is not None:
-            raise NotImplementedError(_DSA_UNSUPPORTED_MSG)
+        # DSA sparse attention runs natively on Ascend (torch port); setting
+        # VLLM_STEP4_SPARSE=0 forces the dense fallback instead.
+        sparse_config = get_step4_sparse_config(config)
         if config.att_impl_type == "GQA":
             norm_dtype = get_norm_dtype(config)
             num_attention_heads = None
@@ -999,6 +1026,7 @@ class Step4DecoderLayer(nn.Module):
                 zero_centered=config.zero_centered,
                 vllm_config=vllm_config,
                 norm_dtype=norm_dtype,
+                sparse_config=sparse_config,
             )
         else:
             raise ValueError(
