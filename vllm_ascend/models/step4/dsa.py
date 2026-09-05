@@ -353,6 +353,19 @@ class Step4DSABackend(AttentionBackend):
         return (0, 1, 2, 3, 4)
 
 
+def _dsa_is_graph_capturing() -> bool:
+    """Whether an ACL/CUDA graph capture is in progress on this stream.
+
+    vllm-ascend shims ``torch.cuda.is_current_stream_capturing`` onto
+    ``torch.npu`` in the model runner, so the torch.cuda spelling works on
+    both platforms.
+    """
+    try:
+        return bool(torch.cuda.is_current_stream_capturing())
+    except Exception:
+        return False
+
+
 class Step4DSAAttentionImpl:
     """Sparse-attention execution over layer-computed region selections."""
 
@@ -383,8 +396,8 @@ class Step4DSAAttentionImpl:
         from vllm.forward_context import get_forward_context
 
         attn_metadata = get_forward_context().attn_metadata
-        if not isinstance(attn_metadata, dict):
-            raise RuntimeError("Step4 DSA impl executed without forward context")
+        if not isinstance(attn_metadata, dict) or _dsa_is_graph_capturing():
+            return output
         md = attn_metadata[layer.layer_name]
         assert isinstance(md, Step4DSAMetadata)
         regions, region_valid, request_ids = selection
@@ -851,8 +864,16 @@ class Step4DSACore(nn.Module, AttentionLayerBase):
         from vllm.forward_context import get_forward_context
 
         attn_metadata = get_forward_context().attn_metadata
-        if not isinstance(attn_metadata, dict):
-            raise RuntimeError("Step4 DSA core executed without forward context")
+        if not isinstance(attn_metadata, dict) or _dsa_is_graph_capturing():
+            # Profile/dummy runs and graph capture execute without scheduled
+            # metadata. Memory accounting only needs a shape-correct output;
+            # the DSA region itself runs eagerly at replay (it is excluded
+            # from compiled/captured graphs via torch.compiler.disable).
+            return torch.zeros(
+                (hidden_states.shape[0], self.num_heads * self.head_dim),
+                dtype=query.dtype,
+                device=query.device,
+            )
         md = attn_metadata[self.layer_name]
         assert isinstance(md, Step4DSAMetadata)
         self._ensure_sidecars()
