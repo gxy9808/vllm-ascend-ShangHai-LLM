@@ -222,10 +222,10 @@ def sparse_attention(
         s = slots[begin:end]
         keys = flat_k[s].float()
         values = flat_v[s].float()
-        scores = torch.einsum("thd,tkhd->htk", q, keys) * scale
+        scores = torch.einsum("thd,tkhd->thk", q, keys) * scale
         scores = scores.masked_fill(~m[:, None, :], _NEG_INF)
         probs = torch.softmax(scores, dim=-1)
-        out[begin:end] = torch.einsum("htk,tkhd->thd", probs, values).to(query.dtype)
+        out[begin:end] = torch.einsum("thk,tkhd->thd", probs, values).to(query.dtype)
     return out
 
 
