@@ -175,10 +175,15 @@ def sparse_attention(
     region_valid: torch.Tensor,
     *,
     scale: float,
+    spec_block_size: int,
     region_size: int = REGION_BLOCK_SIZE,
     row_chunk: int = 32,
 ) -> torch.Tensor:
     """Attention over per-query selected regions, gathered from the paged cache.
+
+    Block-table arithmetic uses the scheduler's *logical* block size
+    (``spec_block_size``); the physical cache may be reshaped to a different
+    kernel block dim, but flattening preserves token order.
 
     Args:
         query: ``[tokens, heads, head_dim]``.
@@ -194,10 +199,9 @@ def sparse_attention(
     """
     tokens, num_heads, head_dim = query.shape
     device = query.device
-    num_blocks, block_size = kv_cache.shape[1], kv_cache.shape[2]
     key_cache, value_cache = kv_cache[0], kv_cache[1]
-    flat_k = key_cache.reshape(num_blocks * block_size, *key_cache.shape[2:])
-    flat_v = value_cache.reshape(num_blocks * block_size, *value_cache.shape[2:])
+    flat_k = key_cache.reshape(-1, *key_cache.shape[2:])
+    flat_v = value_cache.reshape(-1, *value_cache.shape[2:])
 
     out = torch.zeros_like(query)
     offsets = torch.arange(region_size, device=device)
@@ -205,8 +209,8 @@ def sparse_attention(
     token_mask = offsets[None, None, :] < region_valid[:, :, None]
     token_mask &= selected_regions[:, :, None] >= 0
     safe_token = torch.where(token_mask, token_idx, torch.zeros_like(token_idx))
-    pages = block_table[request_ids[:, None, None], safe_token // block_size]
-    slots = (pages * block_size + safe_token % block_size).reshape(tokens, -1)
+    pages = block_table[request_ids[:, None, None], safe_token // spec_block_size]
+    slots = (pages * spec_block_size + safe_token % spec_block_size).reshape(tokens, -1)
     mask2d = token_mask.reshape(tokens, -1)
 
     for begin in range(0, tokens, row_chunk):
@@ -335,6 +339,14 @@ class Step4DSABackend(AttentionBackend):
         return [128, 192]
 
     @staticmethod
+    def get_supported_kernel_block_sizes() -> list[int]:
+        # vllm-ascend's hybrid reshape path divides the spec block size by
+        # this value; it must be a plain int and divide the configured block
+        # size. The sparse path flattens the paged cache, so the kernel block
+        # dim itself carries no semantics.
+        return [128]
+
+    @staticmethod
     def get_kv_cache_shape(
         num_blocks: int,
         block_size: int,
@@ -409,6 +421,7 @@ class Step4DSAAttentionImpl:
             regions,
             region_valid,
             scale=self.scale,
+            spec_block_size=layer._spec_block_size,
             region_size=self.region_size,
         )
 
@@ -612,6 +625,7 @@ class Step4DSACore(nn.Module, AttentionLayerBase):
             region_size=region_size,
         )
         self.kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._spec_block_size: int = int(vllm_config.cache_config.block_size)
         self.summary_cache: torch.Tensor | None = None
         self._pending: dict[int, torch.Tensor] = {}
         self._regions_per_block: int = 0
@@ -636,6 +650,7 @@ class Step4DSACore(nn.Module, AttentionLayerBase):
                 "Step4 DSA requires the KV block size to be a multiple of the "
                 f"region size {self.region_size}, got {block_size}."
             )
+        self._spec_block_size = block_size
         kv_dtype = (
             torch.bfloat16
             if vllm_config.cache_config.cache_dtype == "auto"
@@ -655,8 +670,8 @@ class Step4DSACore(nn.Module, AttentionLayerBase):
         if self.summary_cache is not None or self.kv_cache is None:
             return
         key_cache, _ = self.kv_cache
-        num_blocks, block_size = key_cache.shape[0], key_cache.shape[1]
-        self._regions_per_block = block_size // self.region_size
+        num_blocks, _ = key_cache.shape[0], key_cache.shape[1]
+        self._regions_per_block = self._spec_block_size // self.region_size
         self.summary_cache = torch.zeros(
             (num_blocks * self._regions_per_block, 1, self.proxy_dim),
             device=key_cache.device,
@@ -693,9 +708,8 @@ class Step4DSACore(nn.Module, AttentionLayerBase):
         from its per-block pending buffer, which this method also maintains.
         """
         assert self.summary_cache is not None and self.kv_cache is not None
-        key_cache, _ = self.kv_cache
-        block_size = key_cache.shape[1]
         device = index_k.device
+        block_size = self._spec_block_size
         rs = self.region_size
         seq_cpu = md.seq_lens.cpu().tolist()
         qsl_cpu = md.query_start_loc.cpu().tolist()
@@ -793,9 +807,8 @@ class Step4DSACore(nn.Module, AttentionLayerBase):
         request_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Per-query history scores -> top-k regions + the current region."""
-        assert self.summary_cache is not None and self.kv_cache is not None
-        key_cache, _ = self.kv_cache
-        block_size = key_cache.shape[1]
+        assert self.summary_cache is not None
+        block_size = self._spec_block_size
         rpb = self._regions_per_block
         device = index_q.device
         rs = self.region_size

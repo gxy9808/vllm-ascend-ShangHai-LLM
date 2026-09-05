@@ -160,6 +160,7 @@ def test_sparse_attention_matches_dense_on_selected_regions():
         regions,
         valid,
         scale=scale,
+        spec_block_size=block_size,
         region_size=region_size,
     )
 
@@ -192,6 +193,7 @@ def test_sparse_attention_empty_selection_is_zero():
         torch.full((tokens, 2), -1, dtype=torch.long),
         torch.zeros(tokens, 2, dtype=torch.long),
         scale=0.1,
+        spec_block_size=8,
         region_size=4,
     )
     assert torch.all(got == 0)
