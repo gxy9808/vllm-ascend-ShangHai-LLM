@@ -904,12 +904,14 @@ class Step4DSACore(nn.Module, AttentionLayerBase):
         regions, region_valid = self._score_and_select(
             index_q, weights, md, positions, request_ids
         )
+        # Flatten to [tokens, heads * head_dim] to match the stock Attention
+        # output contract consumed by the parent's gate and o_proj.
         return self.impl.forward(
             self,
             query.view(num_tokens, self.num_heads, self.head_dim),
             self.kv_cache,
             (regions, region_valid, request_ids),
-        )
+        ).reshape(num_tokens, self.num_heads * self.head_dim)
 
     def _project_indexer(
         self,
