@@ -725,6 +725,9 @@ class Step4Attention(nn.Module):
             )
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            # NPU attention kernels require contiguous values in their
+            # non-paged path; v is a raw column slice of the packed qkv.
+            v = v.contiguous()
             # Add qk-norm inline similar to Qwen3 MOE attention
             q_by_head = q.view(
                 *q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim

@@ -272,6 +272,10 @@ def _fused_qknorm_rope_forward_impl(
     q_size = num_q_head * head_dim
     kv_size = num_kv_head * head_dim
     q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+    # v stays a raw column slice of the packed projection; make it explicit
+    # memory since downstream NPU attention kernels require contiguous
+    # values in their non-paged path (q/k are freshly written by the norms).
+    v = v.contiguous()
     q = _rms_norm_per_head(q, qnorm_weight, head_dim, eps, norm_weight_bias)
     k = _rms_norm_per_head(k, knorm_weight, head_dim, eps, norm_weight_bias)
     q = _apply_neox_partial_rope(q, cos, sin, pos_id, num_q_head, head_dim, rotary_dim)
