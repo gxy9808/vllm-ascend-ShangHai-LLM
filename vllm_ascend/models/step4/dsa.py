@@ -139,7 +139,7 @@ def _gather_region_summaries(
     pages = logical // regions_per_block
     offsets = logical % regions_per_block
     phys = block_table_row[pages].long() * regions_per_block + offsets
-    return summary_cache[phys].to(torch.bfloat16).squeeze(1)
+    return summary_cache[phys].squeeze(1)
 
 
 def _select_topk_regions(
@@ -672,10 +672,13 @@ class Step4DSACore(nn.Module, AttentionLayerBase):
         key_cache, _ = self.kv_cache
         num_blocks, _ = key_cache.shape[0], key_cache.shape[1]
         self._regions_per_block = self._spec_block_size // self.region_size
+        # Stored as bf16 widened from the e4m3-rounded summary -- bit-exact
+        # against storing fp8_e4m3 and widening on read, while avoiding NPU
+        # advanced-indexing ops that do not support the fp8 dtype.
         self.summary_cache = torch.zeros(
             (num_blocks * self._regions_per_block, 1, self.proxy_dim),
             device=key_cache.device,
-            dtype=torch.float8_e4m3fn,
+            dtype=torch.bfloat16,
         )
         logger.info_once(
             "Step4 DSA sidecar for %s: %.1f MB summary buffer.",
@@ -748,7 +751,7 @@ class Step4DSACore(nn.Module, AttentionLayerBase):
                         torch.zeros(1, dtype=torch.int32, device=device),
                         torch.full((1,), rs, dtype=torch.int32, device=device),
                         region_size=rs,
-                    )[0]
+                    )[0].to(torch.bfloat16)
                 )
 
             # 3. Stash this chunk's tokens of the (new) incomplete tail region.
@@ -794,7 +797,7 @@ class Step4DSACore(nn.Module, AttentionLayerBase):
                 (1,), self.region_size, dtype=torch.int32, device=pending.device
             ),
             region_size=self.region_size,
-        )[0]
+        )[0].to(torch.bfloat16)
 
     # -- selection ---------------------------------------------------------
 

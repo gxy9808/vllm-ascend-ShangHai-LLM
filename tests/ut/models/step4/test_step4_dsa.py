@@ -202,8 +202,12 @@ def test_sparse_attention_empty_selection_is_zero():
 def test_gather_region_summaries_follows_block_table():
     torch.manual_seed(5)
     regions_per_block, d = 4, 8
-    # 3 physical blocks x 4 regions each; block 1 is the request's second page.
-    cache = torch.randn(3 * regions_per_block, 1, d).to(torch.float8_e4m3fn)
+    # bf16 cache of e4m3-rounded summaries (the NPU-side storage format).
+    cache = (
+        torch.randn(3 * regions_per_block, 1, d)
+        .to(torch.float8_e4m3fn)
+        .to(torch.bfloat16)
+    )
     block_table = torch.tensor([[0, 2]])
     got = _gather_region_summaries(cache, block_table[0], 8, regions_per_block)
     expected = torch.cat(
