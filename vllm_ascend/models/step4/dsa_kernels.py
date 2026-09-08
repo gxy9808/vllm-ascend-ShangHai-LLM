@@ -316,6 +316,7 @@ def _csa_compress_regions_kernel(
     proxy_dim: tl.constexpr,
     BLOCK_T: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    WRITE_FP32: tl.constexpr,
 ) -> None:
     """One program per (region, head): compress a region's tokens into one vector.
 
@@ -358,7 +359,8 @@ def _csa_compress_regions_kernel(
     )
 
     out = region * stride_summary_region + head * stride_summary_head + dims
-    tl.store(summary_ptr + out, summary, mask=dim_ok)
+    if WRITE_FP32:
+        tl.store(summary_ptr + out, summary, mask=dim_ok)
     # Round through bfloat16 on the way to e4m3, matching the CuTe kernel. Going
     # straight from fp32 is observably different: bf16 keeps 8 mantissa bits and e4m3
     # keeps 3, so a value sitting on an e4m3 midpoint can round the other way once bf16
@@ -395,7 +397,8 @@ def csa_compress_regions(
     token_count: torch.Tensor,
     *,
     region_size: int = REGION_BLOCK_SIZE,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    write_fp32: bool = True,
+) -> tuple[torch.Tensor | None, torch.Tensor]:
     """Compress packed tokens into per-region summaries.
 
     Args:
@@ -403,12 +406,16 @@ def csa_compress_regions(
         index_z: ``[tokens, heads, proxy_dim]`` per-dimension softmax logits.
         token_start: ``[regions]`` int32, first token of each region.
         token_count: ``[regions]`` int32, tokens present in each region; 0 = skip.
+        write_fp32: also produce the fp32 copy. Every vLLM consumer only reads the
+            fp8 tensor; the fp32 one exists for parity attribution, and skipping it
+            saves a full-size zeros allocation per call.
 
     Returns:
         ``(summary_fp32, summary_fp8)``, both ``[regions, heads, proxy_dim]``. The fp8
         tensor is what selection and sparse attention consume; the fp32 one exists
         because it is the only place the unrounded value is observable, which is what
         lets a parity failure be attributed to the reduction rather than the rounding.
+        ``summary_fp32`` is ``None`` when ``write_fp32=False``.
     """
     if index_k.shape != index_z.shape:
         raise ValueError(
@@ -422,8 +429,13 @@ def csa_compress_regions(
 
     regions = int(token_start.numel())
     _, heads, proxy_dim = index_k.shape
-    summary = torch.zeros((regions, heads, proxy_dim), device=index_k.device, dtype=torch.float32)
     mean = torch.zeros((regions, heads, proxy_dim), device=index_k.device, dtype=torch.float8_e4m3fn)
+    if write_fp32:
+        summary = torch.zeros((regions, heads, proxy_dim), device=index_k.device, dtype=torch.float32)
+    else:
+        # The fp32 store is compiled out; aliasing the fp8 output keeps the
+        # pointer argument valid and the strides correct for the live store.
+        summary = mean
 
     _csa_compress_regions_kernel[(regions, heads)](
         index_k,
@@ -434,14 +446,218 @@ def csa_compress_regions(
         mean,
         index_k.stride(0),
         index_k.stride(1),
-        summary.stride(0),
-        summary.stride(1),
+        mean.stride(0),
+        mean.stride(1),
         num_heads=heads,
         proxy_dim=proxy_dim,
         BLOCK_T=triton.next_power_of_2(region_size),
         BLOCK_D=triton.next_power_of_2(proxy_dim),
+        WRITE_FP32=write_fp32,
     )
-    return summary, mean
+    return (None if not write_fp32 else summary), mean
+
+
+@triton.jit
+def _append_regions_kernel(
+    pending_k_ptr,
+    pending_z_ptr,
+    chunk_k_ptr,
+    chunk_z_ptr,
+    meta_ptr,
+    summary_ptr,
+    meta_stride,
+    stride_pending_row,
+    stride_pending_tok,
+    stride_chunk_tok,
+    stride_summary_row,
+    stride_summary_region,
+    REGION_SIZE: tl.constexpr,
+    PROXY_DIM_C: tl.constexpr,
+) -> None:
+    """Batched prefill append: compress each request's newly completed regions.
+
+    One program per (request, region index within this append). The region's
+    tokens live in two places -- the first few in the request's pending tail
+    buffer, the rest in the packed prefill chunk -- and both are read directly,
+    so no per-request ``cat``/gather staging tensor is materialized. The
+    softmax-weighted-mean body is byte-identical to
+    ``_csa_compress_regions_kernel`` (including the fp32 -> bf16 -> e4m3 double
+    rounding), and the result is stored straight into the fp8 summary cache.
+
+    ``meta`` is an ``[R, >= 7]`` int32 device tensor, per request:
+    ``[row, r0, delta, plen, ts, n_regions, q_len]`` where ``r0`` is the first
+    newly completed region, ``delta`` the misalignment of the concat stream
+    (0 in the steady state), ``plen`` the effective pending-tail length,
+    ``ts`` the request's first token offset inside the chunk.
+    """
+    req = tl.program_id(0)
+    j = tl.program_id(1)
+
+    row = tl.load(meta_ptr + req * meta_stride + 0).to(tl.int64)
+    n_regions = tl.load(meta_ptr + req * meta_stride + 5).to(tl.int64)
+    if j >= n_regions:
+        return
+    r0 = tl.load(meta_ptr + req * meta_stride + 1).to(tl.int64)
+    delta = tl.load(meta_ptr + req * meta_stride + 2).to(tl.int64)
+    plen = tl.load(meta_ptr + req * meta_stride + 3).to(tl.int64)
+    ts = tl.load(meta_ptr + req * meta_stride + 4).to(tl.int64)
+
+    toks = tl.arange(0, REGION_SIZE)
+    dims = tl.arange(0, PROXY_DIM_C)
+    # Position within the virtual concat stream (pending tail ++ chunk).
+    v = delta + j * REGION_SIZE + toks.to(tl.int64)
+    from_pending = v < plen
+    v_src = tl.where(from_pending, v, v - plen)
+    off_pending = row * stride_pending_row + v_src * stride_pending_tok
+    off_chunk = (ts + v_src) * stride_chunk_tok
+
+    mask = from_pending[:, None] & (dims < PROXY_DIM_C)[None, :]
+    zp = tl.load(pending_z_ptr + off_pending[:, None] + dims[None, :], mask=mask, other=0.0)
+    kp = tl.load(pending_k_ptr + off_pending[:, None] + dims[None, :], mask=mask, other=0.0)
+    mask_c = (~from_pending)[:, None] & (dims < PROXY_DIM_C)[None, :]
+    zc = tl.load(chunk_z_ptr + off_chunk[:, None] + dims[None, :], mask=mask_c, other=0.0)
+    kc = tl.load(chunk_k_ptr + off_chunk[:, None] + dims[None, :], mask=mask_c, other=0.0)
+
+    logits = tl.where(from_pending[:, None], zp, zc).to(tl.float32)
+    values = tl.where(from_pending[:, None], kp, kc).to(tl.float32)
+
+    shift = tl.max(logits)
+    weights = tl.exp(logits - shift)
+    denominator = tl.sum(weights, axis=0)
+    numerator = tl.sum(weights * values, axis=0)
+    summary = tl.where(
+        denominator > 0.0, numerator / tl.maximum(denominator, 1e-20), 0.0
+    )
+
+    out = (
+        row * stride_summary_row
+        + (r0 + j) * stride_summary_region
+        + dims
+    )
+    tl.store(
+        summary_ptr + out,
+        summary.to(tl.bfloat16).to(tl.float8e4nv),
+        mask=dims < PROXY_DIM_C,
+    )
+
+
+@triton.jit
+def _write_pending_tail_kernel(
+    pending_k_ptr,
+    pending_z_ptr,
+    chunk_k_ptr,
+    chunk_z_ptr,
+    meta_ptr,
+    meta_stride,
+    stride_pending_row,
+    stride_pending_tok,
+    stride_chunk_tok,
+    REGION_SIZE: tl.constexpr,
+    PROXY_DIM_C: tl.constexpr,
+) -> None:
+    """Store each request's new ragged tail into the pending buffer.
+
+    The tail is the last ``(plen + q_len) % REGION_SIZE`` tokens of the concat
+    stream. Slots past the tail are written with clamped garbage -- they are
+    never read, because every read of the pending buffer is bounded by
+    ``pending_len``.
+    """
+    req = tl.program_id(0)
+
+    row = tl.load(meta_ptr + req * meta_stride + 0).to(tl.int64)
+    plen = tl.load(meta_ptr + req * meta_stride + 3).to(tl.int64)
+    q_len = tl.load(meta_ptr + req * meta_stride + 6).to(tl.int64)
+    ts = tl.load(meta_ptr + req * meta_stride + 4).to(tl.int64)
+    total = plen + q_len
+    tail = total % REGION_SIZE
+
+    toks = tl.arange(0, REGION_SIZE)
+    dims = tl.arange(0, PROXY_DIM_C)
+    v = total - tail + toks.to(tl.int64)
+    # Clamp keeps the masked-out lanes' addresses in bounds.
+    v = tl.maximum(tl.minimum(v, total - 1), 0)
+    from_pending = v < plen
+    v_src = tl.where(from_pending, v, v - plen)
+    off_pending = row * stride_pending_row + v_src * stride_pending_tok
+    off_chunk = (ts + v_src) * stride_chunk_tok
+
+    mask = (toks < REGION_SIZE)[:, None] & (dims < PROXY_DIM_C)[None, :]
+    mask_p = mask & from_pending[:, None]
+    mask_c = mask & (~from_pending)[:, None]
+    kp = tl.load(pending_k_ptr + off_pending[:, None] + dims[None, :], mask=mask_p, other=0.0)
+    z_p = tl.load(pending_z_ptr + off_pending[:, None] + dims[None, :], mask=mask_p, other=0.0)
+    kc = tl.load(chunk_k_ptr + off_chunk[:, None] + dims[None, :], mask=mask_c, other=0.0)
+    zc = tl.load(chunk_z_ptr + off_chunk[:, None] + dims[None, :], mask=mask_c, other=0.0)
+
+    dst = row * stride_pending_row + toks.to(tl.int64) * stride_pending_tok
+    tl.store(pending_k_ptr + dst[:, None] + dims[None, :], tl.where(from_pending[:, None], kp, kc), mask=mask)
+    tl.store(pending_z_ptr + dst[:, None] + dims[None, :], tl.where(from_pending[:, None], z_p, zc), mask=mask)
+
+
+def append_regions(
+    pending_key: torch.Tensor,
+    pending_z: torch.Tensor,
+    chunk_k: torch.Tensor,
+    chunk_z: torch.Tensor,
+    meta: torch.Tensor,
+    summary: torch.Tensor,
+    *,
+    region_size: int = REGION_BLOCK_SIZE,
+    max_new_regions: int,
+) -> None:
+    """Compress and store all requests' newly completed regions in one launch.
+
+    See ``_append_regions_kernel`` for the ``meta`` layout. ``max_new_regions``
+    is a host-side upper bound on column 5 of ``meta``; extra programs exit
+    after reading their count. The tail write is a second launch over the same
+    metadata (``write_pending_tail``); splitting them keeps each kernel's block
+    shape trivial.
+    """
+    rows = int(meta.shape[0])
+    proxy_dim = int(pending_key.shape[-1])
+    _append_regions_kernel[(rows, max_new_regions)](
+        pending_key,
+        pending_z,
+        chunk_k,
+        chunk_z,
+        meta,
+        summary,
+        meta.stride(0),
+        pending_key.stride(0),
+        pending_key.stride(1),
+        chunk_k.stride(0),
+        summary.stride(0),
+        summary.stride(1),
+        REGION_SIZE=region_size,
+        PROXY_DIM_C=proxy_dim,
+    )
+
+
+def write_pending_tail(
+    pending_key: torch.Tensor,
+    pending_z: torch.Tensor,
+    chunk_k: torch.Tensor,
+    chunk_z: torch.Tensor,
+    meta: torch.Tensor,
+    *,
+    region_size: int = REGION_BLOCK_SIZE,
+) -> None:
+    """Refresh every request's pending tail from the concat stream (one launch)."""
+    rows = int(meta.shape[0])
+    proxy_dim = int(pending_key.shape[-1])
+    _write_pending_tail_kernel[(rows,)](
+        pending_key,
+        pending_z,
+        chunk_k,
+        chunk_z,
+        meta,
+        meta.stride(0),
+        pending_key.stride(0),
+        pending_key.stride(1),
+        chunk_k.stride(0),
+        REGION_SIZE=region_size,
+        PROXY_DIM_C=proxy_dim,
+    )
 
 
 @triton.jit
@@ -459,8 +675,11 @@ def _indexer_logits_kernel(
     stride_w_token,
     stride_w_group,
     stride_out_row,
+    out_q_stride,
+    out_row_base,
     heads_per_group: tl.constexpr,
     proxy_dim: tl.constexpr,
+    K_FP8: tl.constexpr,
     BLOCK_Q: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ) -> None:
@@ -475,6 +694,18 @@ def _indexer_logits_kernel(
     negative; for Step-4's 4 heads per group that event is about 6.25%. Those zeros
     are what the top-k tie-break then has to resolve, so they are load-bearing,
     not noise.
+
+    The e4m3 activation rounding of the query stays on the host on purpose:
+    triton-ascend's in-register fp8 convert does not match torch_npu's
+    ``.to(float8_e4m3fn)`` rounding, and the deployed semantics are the torch
+    ones (the mismatch rate on random bf16 values is ~93%, far beyond
+    accumulation-order noise). The key side reads the fp8 summary cache
+    directly -- widening e4m3 to bf16 is lossless, so only the host's
+    fp8->bf16 staging casts are gone.
+
+    ``out_q_stride``/``out_row_base`` let the kernel write its block directly into
+    a group-major ``[groups * total_q, width]`` buffer at any row offset, so the
+    caller does not have to copy per-request blocks into place afterwards.
     """
     q_block = tl.program_id(0)
     k_block = tl.program_id(1)
@@ -491,6 +722,10 @@ def _indexer_logits_kernel(
         mask=key_ok[None, :],
         other=0.0,
     )
+    if K_FP8:
+        # Widening an e4m3 value to bf16 is lossless, so the kernel can read
+        # the fp8 summary cache directly with no host-side staging cast.
+        key_tile = key_tile.to(tl.bfloat16)
 
     accumulator = tl.zeros((BLOCK_Q, BLOCK_K), dtype=tl.float32)
     for head in tl.static_range(heads_per_group):
@@ -511,7 +746,7 @@ def _indexer_logits_kernel(
         scores = tl.dot(query_tile, key_tile, out_dtype=tl.float32)
         accumulator += tl.maximum(scores, 0.0) * head_weight[:, None]
 
-    rows = group * seq_q + queries
+    rows = group * out_q_stride + out_row_base + queries
     tl.store(
         out_ptr + rows[:, None] * stride_out_row + keys[None, :],
         accumulator,
@@ -541,21 +776,30 @@ def indexer_logits(
     weights: torch.Tensor,
     index_k: torch.Tensor,
     *,
+    out: torch.Tensor | None = None,
+    out_row_offset: int = 0,
+    out_q_stride: int | None = None,
     block_q: int = 16,
     block_k: int = 64,
 ) -> torch.Tensor:
     """Weighted-ReLU indexer scores over proxy keys.
 
     Args:
-        index_q: ``[seq_q, groups, heads_per_group, proxy_dim]``.
+        index_q: ``[seq_q, groups, heads_per_group, proxy_dim]`` bf16.
         weights: ``[seq_q, groups, heads_per_group]``, already carrying the
             ``heads_per_group ** -0.5`` prescale.
         index_k: ``[seq_k, 1, proxy_dim]`` -- one shared key head (the indexer is MQA
-            even though the main attention is GQA).
+            even though the main attention is GQA). fp8_e4m3fn is accepted
+            directly (the summary cache's dtype) and widened in-register.
+        out: optional preallocated ``[groups * out_q_stride, seq_k]`` fp32 buffer the
+            kernel writes into, at row ``group * out_q_stride + out_row_offset``;
+            defaults to a fresh ``[groups * seq_q, seq_k]`` tensor. Lets a batched
+            caller assemble one group-major buffer without per-request copies.
 
     Returns:
-        ``[groups * seq_q, seq_k]`` float32, group-major then query. That row order is
-        what the region selector consumes, so it is a contract rather than a convenience.
+        ``[groups * seq_q, seq_k]`` float32, group-major then query (or ``out`` when
+        given). That row order is what the region selector consumes, so it is a
+        contract rather than a convenience.
     """
     if index_k.shape[1] != 1:
         raise ValueError(f"indexer keys are MQA; expected one head, got {index_k.shape[1]}")
@@ -564,29 +808,183 @@ def indexer_logits(
     if index_k.shape[2] != proxy_dim:
         raise ValueError(f"proxy_dim mismatch: q={proxy_dim} k={index_k.shape[2]}")
 
-    quantized_q = round_activations_e4m3(index_q)
-    quantized_k = round_activations_e4m3(index_k)
-    out = torch.empty((groups * seq_q, seq_k), device=index_q.device, dtype=torch.float32)
+    k_fp8 = index_k.dtype == torch.float8_e4m3fn
+    index_q = round_activations_e4m3(index_q)
+    if not k_fp8:
+        index_k = round_activations_e4m3(index_k)
+    if out is None:
+        out = torch.empty((groups * seq_q, seq_k), device=index_q.device, dtype=torch.float32)
+        out_q_stride = seq_q
+        out_row_base = 0
+    else:
+        out_q_stride = seq_q if out_q_stride is None else out_q_stride
+        out_row_base = out_row_offset
 
     _indexer_logits_kernel[
         (triton.cdiv(seq_q, block_q), triton.cdiv(seq_k, block_k), groups)
     ](
-        quantized_q,
-        quantized_k,
+        index_q,
+        index_k,
         weights,
         out,
         seq_q,
         seq_k,
-        quantized_q.stride(0),
-        quantized_q.stride(1),
-        quantized_q.stride(2),
-        quantized_k.stride(0),
+        index_q.stride(0),
+        index_q.stride(1),
+        index_q.stride(2),
+        index_k.stride(0),
         weights.stride(0),
         weights.stride(1),
         out.stride(0),
+        out_q_stride,
+        out_row_base,
         heads_per_group=heads_per_group,
         proxy_dim=proxy_dim,
+        K_FP8=k_fp8,
         BLOCK_Q=block_q,
+        BLOCK_K=block_k,
+    )
+    return out
+
+
+@triton.jit
+def _indexer_logits_rows_kernel(
+    q_ptr,
+    w_ptr,
+    summary_ptr,
+    out_ptr,
+    n_rows,
+    seq_k,
+    q_per_row,
+    stride_q_token,
+    stride_q_group,
+    stride_q_head,
+    stride_w_token,
+    stride_w_group,
+    stride_k_row,
+    stride_k_token,
+    stride_out_row,
+    heads_per_group: tl.constexpr,
+    proxy_dim: tl.constexpr,
+    Q_PER_ROW: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+) -> None:
+    """Batched decode scoring: one program per (batch row, key tile, group).
+
+    Every batch row keeps its own summary row in ``summary_ptr`` (the fp8 side
+    cache), so unlike :func:`_indexer_logits_kernel` the key tile is *not* shared
+    across queries -- each program loads the tile of its own row and scores all
+    ``Q_PER_ROW`` query tokens (1 for plain decode, k for spec-decode verify)
+    against it, writing straight into the group-major logits buffer. What used to
+    be one tiny kernel launch per request becomes one launch for the whole batch.
+
+    The dot product is a multiply-and-reduce rather than ``tl.dot`` on purpose: a
+    decode row has at most 8 query tokens, so an MMA tile would be almost entirely
+    padding, while this shape is memory-bound on the summary read either way.
+    Products and accumulation are fp32, matching the fp32 accumulation of the
+    prefill kernel. The query arrives already e4m3-rounded (host semantics --
+    see ``_indexer_logits_kernel``); the fp8 summary tile is widened in-register,
+    which is lossless.
+    """
+    row = tl.program_id(0)
+    k_block = tl.program_id(1)
+    group = tl.program_id(2)
+
+    keys = k_block * BLOCK_K + tl.arange(0, BLOCK_K)
+    key_ok = keys < seq_k
+    dims = tl.arange(0, proxy_dim)
+
+    k_tile = tl.load(
+        summary_ptr
+        + row.to(tl.int64) * stride_k_row
+        + keys[:, None].to(tl.int64) * stride_k_token
+        + dims[None, :],
+        mask=key_ok[:, None],
+        other=0.0,
+    ).to(tl.bfloat16).to(tl.float32)
+
+    for qi in tl.static_range(Q_PER_ROW):
+        token = row * Q_PER_ROW + qi
+        acc = tl.zeros((BLOCK_K,), dtype=tl.float32)
+        for head in tl.static_range(heads_per_group):
+            q_vec = tl.load(
+                q_ptr
+                + token.to(tl.int64) * stride_q_token
+                + group * stride_q_group
+                + head * stride_q_head
+                + dims
+            ).to(tl.float32)
+            head_weight = tl.load(
+                w_ptr + token * stride_w_token + group * stride_w_group + head
+            ).to(tl.float32)
+            dots = tl.sum(k_tile * q_vec[None, :], axis=1)
+            acc += tl.maximum(dots, 0.0) * head_weight
+        out_row = group * (n_rows * Q_PER_ROW) + token
+        tl.store(
+            out_ptr + out_row.to(tl.int64) * stride_out_row + keys,
+            acc,
+            mask=key_ok,
+        )
+
+
+def indexer_logits_rows(
+    index_q: torch.Tensor,
+    weights: torch.Tensor,
+    summary: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    q_per_row: int,
+    block_k: int = 32,
+) -> torch.Tensor:
+    """Score every decode row of the batch against its own summary row, one launch.
+
+    Args:
+        index_q: ``[n_rows * q_per_row, groups, heads_per_group, proxy_dim]`` bf16,
+            row-major over (row, query token) -- exactly how decode and uniform
+            spec-decode verify batches arrive.
+        weights: same token layout, fp32, prescaled.
+        summary: ``[>= n_rows, >= seq_k, 1, proxy_dim]`` fp8 summary cache; row
+            ``r``'s queries are scored against ``summary[r, :seq_k]``.
+        out: ``[groups * n_rows * q_per_row, seq_k]`` fp32, group-major row order,
+            where ``seq_k = out.shape[1]``. Dead columns hold scores of stale
+            summaries, exactly like the eager per-row path wrote them.
+        q_per_row: query tokens per batch row (1 or the spec-decode k).
+
+    Returns:
+        ``out`` (written in place).
+    """
+    n_tokens, groups, heads_per_group, proxy_dim = index_q.shape
+    if q_per_row <= 0 or n_tokens % q_per_row:
+        raise ValueError(f"n_tokens {n_tokens} not divisible by q_per_row {q_per_row}")
+    n_rows = n_tokens // q_per_row
+    seq_k = int(out.shape[1])
+    if summary.shape[0] < n_rows or summary.shape[2] != 1:
+        raise ValueError(
+            f"summary must cover {n_rows} rows with one head, got {tuple(summary.shape)}"
+        )
+    index_q = round_activations_e4m3(index_q)
+
+    _indexer_logits_rows_kernel[
+        (n_rows, triton.cdiv(seq_k, block_k), groups)
+    ](
+        index_q,
+        weights,
+        summary,
+        out,
+        n_rows,
+        seq_k,
+        q_per_row,
+        index_q.stride(0),
+        index_q.stride(1),
+        index_q.stride(2),
+        weights.stride(0),
+        weights.stride(1),
+        summary.stride(0),
+        summary.stride(1),
+        out.stride(0),
+        heads_per_group=heads_per_group,
+        proxy_dim=proxy_dim,
+        Q_PER_ROW=q_per_row,
         BLOCK_K=block_k,
     )
     return out

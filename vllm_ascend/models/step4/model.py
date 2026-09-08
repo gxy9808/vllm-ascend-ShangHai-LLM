@@ -20,7 +20,6 @@ from __future__ import annotations
 import copy
 import os
 
-_DBG_STEP = [0]
 from typing import Any
 
 import torch
@@ -613,74 +612,6 @@ class AscendStep4DecoderLayer(Step4DecoderLayer):
         )
         self.prefix = prefix
         self.use_attention_o_proj_reduce_scatter = False
-        if os.environ.get("VLLM_STEP4_DEBUG_NORMS") == "1":
-            self._dbg_calls = 0
-            if layer_idx in (1, 2, 3, 4, 20, 60, 88, 91):
-                rk0 = get_tensor_model_parallel_rank()
-
-                def res_pre_hook(module, args, _li=layer_idx, _rk=rk0):
-                    if args[0].shape[0] == 6:
-                        torch.save(
-                            {"res": args[0].detach().cpu()},
-                            f"/tmp/res_dump_r{_rk}_l{_li}.pt",
-                        )
-                        print(f"RES_DUMPED r{_rk} l{_li}", flush=True)
-
-                self.input_layernorm.register_forward_pre_hook(res_pre_hook)
-            targets = [("attn", self.self_attn)]
-            if self.use_moe:
-                targets.append(("moe", self.moe))
-            else:
-                targets.append(("mlp", self.mlp))
-            for tag, mod in targets:
-                mod.register_forward_hook(
-                    self._make_norm_hook(layer_idx, tag), with_kwargs=True
-                )
-            if layer_idx == 3 and self.use_moe:
-                rk3 = get_tensor_model_parallel_rank()
-                for tag, mod in [
-                    ("gate", self.moe.gate),
-                    ("exp", self.moe.experts),
-                    ("shex", self.moe.share_expert),
-                ]:
-                    mod.register_forward_hook(
-                        self._make_norm_hook(layer_idx, tag), with_kwargs=True
-                    )
-            if layer_idx == 0 and not self.use_moe:
-                m = self.mlp
-                qm_g = getattr(getattr(m, "gate_up_proj", None), "quant_method", None)
-                qm_d = getattr(getattr(m, "down_proj", None), "quant_method", None)
-                w_g = getattr(m.gate_up_proj, "weight", None)
-                w_d = getattr(m.down_proj, "weight", None)
-                print(
-                    f"MLPDBG quant={type(qm_g).__name__}/{type(qm_d).__name__} "
-                    f"limit={getattr(m, chr(108)+chr(105)+chr(109)+chr(105)+chr(116), None)} "
-                    f"wg={None if w_g is None else (str(w_g.dtype), tuple(w_g.shape))} "
-                    f"wd={None if w_d is None else (str(w_d.dtype), tuple(w_d.shape))}",
-                    flush=True,
-                )
-                rk_m = get_tensor_model_parallel_rank()
-                for tag, mod in [("gu", m.gate_up_proj), ("dproj", m.down_proj)]:
-                    mod.register_forward_hook(
-                        self._make_norm_hook(layer_idx, tag), with_kwargs=True
-                    )
-            if layer_idx == 0:
-                attn_mod = self.self_attn
-                sub = [("qkv", getattr(attn_mod, "qkvg_proj", None) or attn_mod.qkv_proj),
-                       ("core", attn_mod.attn),
-                       ("gproj", getattr(attn_mod, "g_proj", None)),
-                       ("oproj", attn_mod.o_proj)]
-                for tag, mod in [("qn", attn_mod.q_norm), ("kn", attn_mod.k_norm),
-                                 ("rope", getattr(attn_mod, "rotary_emb", None))]:
-                    if mod is not None:
-                        mod.register_forward_hook(
-                            self._make_norm_hook(layer_idx, tag), with_kwargs=True
-                        )
-                for tag, mod in sub:
-                    if mod is not None:
-                        mod.register_forward_hook(
-                            self._make_norm_hook(layer_idx, tag), with_kwargs=True
-                        )
 
 
     def _forward_ffn(
@@ -720,77 +651,6 @@ class AscendStep4DecoderLayer(Step4DecoderLayer):
             shared_output = tensor_model_parallel_all_reduce(shared_output)
         return moe_output + shared_output
 
-    @staticmethod
-    def _make_norm_hook(layer_idx: int, tag: str):
-        rk = get_tensor_model_parallel_rank()
-
-        def hook(module, inputs, kwargs, output):
-            if layer_idx == 0 and tag == "attn":
-                _DBG_STEP[0] += 1
-            t = output[0] if isinstance(output, tuple) else output
-            if t is None or not torch.is_tensor(t):
-                return
-            src_t = kwargs.get("hidden_states") if kwargs else None
-            if src_t is None:
-                src_t = inputs[0] if inputs else t
-            if _DBG_STEP[0] > 4:
-                return
-            if layer_idx == 0 and tag == "core" and t.shape[0] == 6:
-                torch.save(
-                    {"q": inputs[0].detach().cpu(), "k": inputs[1].detach().cpu(),
-                     "v": inputs[2].detach().cpu(), "out": t.detach().cpu()},
-                    f"/tmp/core_dump_r{rk}.pt",
-                )
-                print(f"CORE_DUMPED r{rk}", flush=True)
-            if layer_idx == 0 and tag in ("qn", "kn", "rope") and t.shape[0] == 6:
-                torch.save(
-                    {"in": (inputs[0].detach().cpu() if inputs else None),
-                     "out": t.detach().cpu()},
-                    f"/tmp/{tag}_dump_r{rk}.pt",
-                )
-                print(f"{tag.upper()}_DUMPED r{rk}", flush=True)
-            if layer_idx == 0 and tag == "qkv" and t.shape[0] == 6:
-                torch.save({"out": t.detach().cpu()}, f"/tmp/qkvw_dump_r{rk}.pt")
-                print(f"QKVW_DUMPED r{rk}", flush=True)
-            if layer_idx == 3 and tag in ("gate", "exp", "shex") and t.shape[0] == 6:
-                torch.save(
-                    {"in": [a.detach().cpu() for a in inputs if torch.is_tensor(a)],
-                     "kw": [a.detach().cpu() for a in (kwargs or {}).values() if torch.is_tensor(a)],
-                     "out": t.detach().cpu()},
-                    f"/tmp/moe_{tag}_r{rk}.pt",
-                )
-                print(f"MOE_{tag.upper()}_DUMPED r{rk}", flush=True)
-            if layer_idx == 0 and tag in ("gu", "dproj") and t.shape[0] == 6:
-                torch.save(
-                    {"in": (inputs[0].detach().cpu() if inputs else None),
-                     "out": t.detach().cpu(),
-                     "w": module.weight.detach().cpu() if hasattr(module, "weight") else None},
-                    f"/tmp/{tag}_dump_r{rk}.pt",
-                )
-                print(f"{tag.upper()}_DUMPED r{rk}", flush=True)
-            if layer_idx == 0 and tag == "gproj" and t.shape[0] == 6:
-                torch.save(
-                    {"h": src_t[:8].detach().cpu(), "logits": t[:8].detach().cpu(),
-                     "w_runtime": module.weight.detach().cpu()},
-                    f"/tmp/gproj_dump_r{rk}.pt",
-                )
-                print(f"GPROJ_DUMPED r{rk} w=", tuple(module.weight.shape), flush=True)
-            extra = ""
-            if t.dim() == 2 and tag == "gproj":
-                flat = t.float().flatten().sort().values
-                n = flat.numel()
-                dec = [flat[i * (n - 1) // 10].item() for i in range(11)]
-                extra = (
-                    f" deciles={[round(v, 2) for v in dec]} "
-                    f"sig_raw={t.sigmoid().float().mean().item():.5f}"
-                )
-            print(
-                f"NORMDBG r{rk} layer={layer_idx} {tag} call={_DBG_STEP[0]} "
-                f"in={src_t.float().abs().mean():.4f} "
-                f"out={t.float().abs().mean():.4f} max={t.float().abs().max():.4f}{extra}",
-                flush=True,
-            )
-        return hook
 
 
 class AscendStep4Model(Step4Model):

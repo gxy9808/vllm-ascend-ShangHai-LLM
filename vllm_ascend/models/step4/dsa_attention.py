@@ -40,12 +40,15 @@ from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec, KVCacheSpec
 
 from vllm_ascend.models.step4.dsa_kernels import (
+    append_regions,
     csa_compress_regions,
     decode_sparse_meta,
     indexer_logits,
+    indexer_logits_rows,
     prefill_sparse_meta,
     sparse_attention_decode,
     sparse_attention_prefill,
+    write_pending_tail,
 )
 
 
@@ -171,12 +174,21 @@ class AscendStep4DSAPrefillMetadata:
 
     max_query_len: int
 
+    num_query_tokens: int = 0
+    """Total prefill query tokens, filled from the CPU start-loc copy so the
+    step never pays a device sync for it."""
+
+    seq_lens_host: list = None
+    context_lens_host: list = None
+    """CPU copies produced by the builder's existing seq_lens transfer; the
+    impl reads these instead of calling ``.tolist()`` on device tensors."""
+
     @property
     def query_lens(self) -> torch.Tensor:
         return self.query_start_loc[1:] - self.query_start_loc[:-1]
 
     @property
-    def num_query_tokens(self) -> int:
+    def num_query_tokens_padded(self) -> int:
         return int(self.query_start_loc[-1])
 
 
@@ -265,10 +277,14 @@ class AscendStep4DSAMetadataBuilder(
             prefill_query_lens = qsl_cpu[num_decodes + 1 : prefill_end + 1] - qsl_cpu[
                 num_decodes:prefill_end
             ]
+            # One CPU round trip that already existed for context_lens: keep the
+            # host lists around so the prefill step never calls .tolist() on a
+            # device tensor again (each of those stalls the NPU pipeline).
+            seq_lens_host_t = seq_lens[num_decodes:prefill_end].detach().cpu()
+            context_lens_host_t = seq_lens_host_t - prefill_query_lens
             prefill_context_lens = self.context_len_buffer[num_decodes:prefill_end]
             prefill_context_lens.copy_(
-                (seq_lens[num_decodes:prefill_end].detach().cpu() - prefill_query_lens)
-                .to(
+                context_lens_host_t.to(
                     device=self.context_len_buffer.device,
                     dtype=torch.int32,
                     non_blocking=True,
@@ -282,6 +298,9 @@ class AscendStep4DSAMetadataBuilder(
                 query_start_loc=query_start_loc[num_decodes : prefill_end + 1]
                 - num_decode_tokens,
                 max_query_len=int(prefill_query_lens.max()),
+                num_query_tokens=int(prefill_query_lens.sum()),
+                seq_lens_host=seq_lens_host_t.tolist(),
+                context_lens_host=context_lens_host_t.tolist(),
             )
 
         decode_metadata: AscendStep4DSADecodeMetadata | None = None
@@ -352,73 +371,6 @@ class AscendStep4DSAState:
         self.pending_z = torch.zeros_like(self.pending_key)
         self.pending_len = torch.zeros((max_num_seqs,), device=device, dtype=torch.int32)
 
-    def _compress_regions(
-        self, key: torch.Tensor, z: torch.Tensor, num_regions: int
-    ) -> torch.Tensor:
-        starts = torch.arange(
-            num_regions, device=key.device, dtype=torch.int32
-        ) * self.region_size
-        counts = torch.full(
-            (num_regions,), self.region_size, device=key.device, dtype=torch.int32
-        )
-        _, summary_fp8 = csa_compress_regions(
-            key, z, starts, counts, region_size=self.region_size
-        )
-        return summary_fp8
-
-    def append_chunk(
-        self,
-        row: int,
-        past: int,
-        chunk_key: torch.Tensor,
-        chunk_z: torch.Tensor,
-    ) -> None:
-        """Append one request's chunk of index_k/index_z and compress regions.
-
-        The chunk's tokens are laid out contiguously in ``chunk_key`` /
-        ``chunk_z``; ``past`` is the request's cached length before this
-        chunk.  Regions filled by this append are compressed and written into
-        ``summary``; the ragged tail stays in the pending buffer.
-        """
-        plen = int(self.pending_len[row])
-        # A fresh request in this row must not see the previous occupant's
-        # pending tail; the summaries themselves need no zeroing because
-        # scoring never reads past the live history length.  A resumed
-        # request (spec-decode rejection or retraction) truncates the same
-        # way: the true tail always ends at `past`, so entries beyond
-        # past % region_size are stale and get re-appended by this chunk.
-        if past == 0:
-            plen = 0
-            self.pending_len[row] = 0
-        else:
-            plen = min(plen, past % self.region_size)
-        if plen:
-            key = torch.cat(
-                (self.pending_key[row, :plen], chunk_key.contiguous()), dim=0
-            )
-            z = torch.cat((self.pending_z[row, :plen], chunk_z.contiguous()), dim=0)
-        else:
-            key = chunk_key.contiguous()
-            z = chunk_z.contiguous()
-
-        # key already contains the pending prefix when plen > 0
-        total = key.shape[0]
-        num_regions = total // self.region_size
-        if num_regions:
-            region_base = past // self.region_size
-            self.summary[row, region_base : region_base + num_regions] = (
-                self._compress_regions(key, z, num_regions)
-            )
-        tail = total % self.region_size
-        if tail:
-            self.pending_key[row, :tail] = key[num_regions * self.region_size :].to(
-                self.pending_key.dtype
-            )
-            self.pending_z[row, :tail] = z[num_regions * self.region_size :].to(
-                self.pending_z.dtype
-            )
-        self.pending_len[row] = tail
-
 
 class AscendStep4DSAImpl(AttentionImplBase[AscendStep4DSAMetadata]):
     def __init__(
@@ -467,26 +419,36 @@ class AscendStep4DSAImpl(AttentionImplBase[AscendStep4DSAMetadata]):
         weights: torch.Tensor,
         num_tokens: int,
         num_rows: int,
-        seq_lens: torch.Tensor,
-        context_lens: torch.Tensor,
+        seq_lens_host: list,
+        context_lens_host: list,
         summary_row_offset: int,
     ) -> torch.Tensor:
         """Indexer scores for the first ``num_rows`` batch rows.
 
-        ``seq_lens``/``context_lens`` are indexed by relative row;
-        ``summary_row_offset`` maps a relative row to its batch row (decode
-        requests sit at offset 0, prefill requests after the decodes).
-        Mirrors the reference ``score_regions``: a [groups * total_q, width]
-        fp32 tensor in group-major row order, width sized to the live history
-        rather than the capacity.
+        ``seq_lens_host``/``context_lens_host`` are the builder's CPU copies
+        (no device sync here); ``summary_row_offset`` maps a relative row to
+        its batch row (decode requests sit at offset 0, prefill requests after
+        the decodes).  Mirrors the reference ``score_regions``: a
+        [groups * total_q, width] fp32 tensor in group-major row order, width
+        sized to the live history rather than the capacity.  Each request's
+        kernel writes its block straight into the buffer at the right
+        group-major offset -- no per-request result copies, and the fp8
+        summary is read directly (widened in-register).
         """
         groups = self.num_kv_groups
-        seq_lens_list = seq_lens.tolist()
-        context_lens_list = context_lens.tolist()
-        last_positions = [
-            context_lens_list[row] + seq_lens_list[row] - 1
+        # ``seq_lens`` from the common attention metadata hold each request's
+        # FULL history (past + this chunk's query tokens); the per-row query
+        # length is the difference. Chunked-prefill rows have past > 0, and
+        # treating the total as the query length makes ``regions`` overflow
+        # the summary capacity (regions > max_regions) on the second chunk.
+        query_lens_list = [
+            int(seq_lens_host[row]) - int(context_lens_host[row])
             for row in range(num_rows)
-            if seq_lens_list[row] > 0
+        ]
+        last_positions = [
+            int(seq_lens_host[row]) - 1
+            for row in range(num_rows)
+            if query_lens_list[row] > 0
         ]
         width = max(
             (position // self.region_size for position in last_positions), default=0
@@ -499,26 +461,22 @@ class AscendStep4DSAImpl(AttentionImplBase[AscendStep4DSAMetadata]):
 
         offset = 0
         for row in range(num_rows):
-            length = int(seq_lens_list[row])
+            length = query_lens_list[row]
             if length == 0:
                 continue
-            regions = (int(context_lens_list[row]) + length - 1) // self.region_size
+            regions = (int(seq_lens_host[row]) - 1) // self.region_size
             if regions == 0:
                 offset += length
                 continue
             batch_row = summary_row_offset + row
-            block = indexer_logits(
-                index_q[offset : offset + length].contiguous(),
-                weights[offset : offset + length].contiguous(),
-                state.summary[batch_row, :regions].to(index_q.dtype),
+            indexer_logits(
+                index_q[offset : offset + length],
+                weights[offset : offset + length],
+                state.summary[batch_row, :regions],
+                out=logits,
+                out_row_offset=offset,
+                out_q_stride=num_tokens,
             )
-            for group in range(groups):
-                rows_slice = slice(
-                    group * num_tokens + offset, group * num_tokens + offset + length
-                )
-                logits[rows_slice, :regions] = block[
-                    group * length : (group + 1) * length
-                ]
             offset += length
         return logits
 
@@ -588,6 +546,7 @@ class AscendStep4DSAImpl(AttentionImplBase[AscendStep4DSAMetadata]):
             token_start,
             token_count,
             region_size=rs,
+            write_fp32=False,
         )
         rows_idx = torch.arange(num_reqs, device=reg_key.device)
         dst_region = torch.div(past, rs, rounding_mode="floor").to(torch.int64)
@@ -616,26 +575,27 @@ class AscendStep4DSAImpl(AttentionImplBase[AscendStep4DSAMetadata]):
             full, torch.zeros_like(plen_eff), plen_eff + 1
         )
 
-        # Region scoring over the full static capacity. Dead columns hold
-        # stale scores, but region_topk_ids only reads columns below each
-        # row's live history length, so selection matches the eager
-        # live-width path exactly.
+        # Region scoring over the full static capacity, the whole batch in
+        # one kernel launch (it used to be one tiny launch per request).
+        # Dead columns hold stale scores, but region_topk_ids only reads
+        # columns below each row's live history length, so selection matches
+        # the eager live-width path exactly. The fp8 summary is read
+        # directly -- the per-row fp8->bf16 staging casts are gone.
         cap = state.max_regions
         logits = _get_shared_decode_logits(
             groups * state.max_num_seqs * rs, cap, index_q.device
         )[: groups * num_reqs]
-        summary_live = state.summary[:, :cap]
-        for row in range(num_reqs):
-            block = indexer_logits(
-                index_q[row : row + 1].contiguous(),
-                weights[row : row + 1].contiguous(),
-                summary_live[row].to(index_q.dtype),
-            )
-            for g in range(groups):
-                logits[g * num_reqs + row] = block[g]
+        indexer_logits_rows(
+            index_q[:num_reqs],
+            weights[:num_reqs],
+            state.summary,
+            logits,
+            q_per_row=1,
+        )
+        seq_lens_i32 = d.seq_lens.to(torch.int32)
         packed, counts = decode_sparse_meta(
             logits,
-            d.seq_lens.to(torch.int32),
+            seq_lens_i32,
             d.block_table,
             topk=self.topk_regions,
             region_size=self.region_size,
@@ -647,7 +607,7 @@ class AscendStep4DSAImpl(AttentionImplBase[AscendStep4DSAMetadata]):
             value_flat,
             packed,
             counts,
-            d.seq_lens.to(torch.int32),
+            seq_lens_i32,
             num_kv_groups=self.num_kv_groups,
             region_size=self.region_size,
             softmax_scale=self.scale,
@@ -754,7 +714,7 @@ class AscendStep4DSAImpl(AttentionImplBase[AscendStep4DSAMetadata]):
         )
         token_count = torch.full((n,), rs, device=seq_lens.device, dtype=torch.int32)
         _, reg_summary = csa_compress_regions(
-            reg_key, reg_z, token_start, token_count, region_size=rs
+            reg_key, reg_z, token_start, token_count, region_size=rs, write_fp32=False
         )
         rows_idx = torch.arange(n, device=seq_lens.device)
         dst_region = torch.div(past, rs, rounding_mode="floor").to(torch.int64)
@@ -765,37 +725,35 @@ class AscendStep4DSAImpl(AttentionImplBase[AscendStep4DSAMetadata]):
         )
 
         # Pending tail = last (total_after % rs) tokens of the window,
-        # written through per-slot device indices; masked lanes use the
-        # trash slot at index rs.
+        # refreshed with one vectorized gather per side buffer (it used to
+        # be rs-1 iterations of where + index_put_ pairs). Slots past the
+        # tail receive clamped garbage that is never read: every access to
+        # the pending buffer is bounded by pending_len.
+        w = win_k.shape[1]
         tail_len = torch.remainder(total_after, rs).to(torch.int64)
-        for j in range(rs - 1):
-            src_tok = rs - 1 + k - 1 - j  # window index, static
-            valid = j < tail_len
-            pos = torch.where(valid, tail_len - 1 - j, torch.full_like(tail_len, rs))
-            state.pending_key.index_put_(
-                (rows_idx, pos), win_k[:, src_tok]
-            )
-            state.pending_z.index_put_(
-                (rows_idx, pos), win_z[:, src_tok]
-            )
+        src = (w - tail_len)[:, None] + torch.arange(
+            rs, device=seq_lens.device, dtype=torch.int64
+        )[None, :]
+        src = src.clamp_(0, w - 1)
+        src4 = src[:, :, None, None].expand(n, rs, *state.pending_key.shape[2:])
+        state.pending_key[:n, :rs] = win_k.gather(1, src4)
+        state.pending_z[:n, :rs] = win_z.gather(1, src4)
         state.pending_len[:n] = tail_len.to(torch.int32)
 
-        # Prefill-style scoring over the static region capacity.
+        # Prefill-style scoring over the static region capacity: the whole
+        # batch in one kernel launch (q_per_row = k), writing straight into
+        # the group-major logits buffer.
         cap = state.max_regions
         logits = _get_shared_decode_logits(
             groups * state.max_num_seqs * rs, cap, index_q.device
         )[: groups * n * k]
-        summary_live = state.summary[:, :cap]
-        for row in range(n):
-            block = indexer_logits(
-                index_q[row * k : (row + 1) * k].contiguous(),
-                weights[row * k : (row + 1) * k].contiguous(),
-                summary_live[row].to(index_q.dtype),
-            )
-            for g in range(groups):
-                logits[g * n * k + row * k : g * n * k + (row + 1) * k] = block[
-                    g * k : (g + 1) * k
-                ]
+        indexer_logits_rows(
+            index_q[: n * k],
+            weights[: n * k],
+            state.summary,
+            logits,
+            q_per_row=k,
+        )
 
         q_positions = positions[: n * k].to(torch.int32)
         requests = torch.div(
@@ -803,11 +761,14 @@ class AscendStep4DSAImpl(AttentionImplBase[AscendStep4DSAMetadata]):
             k,
             rounding_mode="floor",
         )
+        if groups > 1:
+            q_positions = q_positions.repeat(groups).contiguous()
+            requests = requests.repeat(groups).contiguous()
         packed, counts = prefill_sparse_meta(
             logits,
-            q_positions.repeat(groups).contiguous(),
+            q_positions,
             d.block_table,
-            requests.repeat(groups).contiguous(),
+            requests,
             topk=self.topk_regions,
             region_size=rs,
             regions_per_page=self.regions_per_page,
@@ -844,51 +805,90 @@ class AscendStep4DSAImpl(AttentionImplBase[AscendStep4DSAMetadata]):
         p = md.prefill
         assert p is not None
         num_reqs = md.num_prefills
-        q_lens = p.query_lens.tolist()
-        ctx_lens = p.context_lens.tolist()
+        rs = self.region_size
+        device = index_q.device
+        num_query_tokens = p.num_query_tokens
 
-        offset = 0
-        for row in range(num_reqs):
-            length = int(q_lens[row])
-            past = int(ctx_lens[row])
-            state.append_chunk(
-                md.num_decodes + row,
-                past,
-                index_k[offset : offset + length],
-                index_z[offset : offset + length],
-            )
-            offset += length
+        # ---- batched append: compress every request's newly completed regions
+        # with one launch, reading pending tail and chunk tokens in place (no
+        # per-request cat/contiguous/host sync). Per-request bookkeeping:
+        #   plen_eff = min(pending_len, past % rs)   (fresh rows clamp to 0)
+        #   r0      = first newly completed region, delta = stream misalignment
+        #   n       = (past + q_len) // rs - r0 completed inside this append
+        rows_t = torch.arange(
+            md.num_decodes, md.num_decodes + num_reqs, device=device, dtype=torch.int32
+        )
+        rows_long = rows_t.long()
+        past = p.context_lens
+        plen_eff = torch.minimum(state.pending_len[rows_long], torch.remainder(past, rs))
+        # NB: integer torch.div without rounding_mode is true division -- the
+        # float results would truncate on the int32 casts below and corrupt
+        # every derived offset.
+        r0 = torch.div(past - plen_eff + (rs - 1), rs, rounding_mode="floor")
+        delta = r0 * rs - (past - plen_eff)
+        q_lens_dev = p.query_start_loc[1:] - p.query_start_loc[:-1]
+        ts = p.query_start_loc[:num_reqs]
+        n_new = torch.div(past + q_lens_dev, rs, rounding_mode="floor") - r0
+        meta = torch.stack(
+            (rows_t, r0.to(torch.int32), delta.to(torch.int32), plen_eff, ts, n_new.to(torch.int32), q_lens_dev),
+            dim=1,
+        ).contiguous()
+        max_new = max(
+            (int(s) - int(c)) // rs + 2
+            for s, c in zip(p.seq_lens_host, p.context_lens_host)
+        )
+        append_regions(
+            state.pending_key,
+            state.pending_z,
+            index_k,
+            index_z,
+            meta,
+            state.summary,
+            region_size=rs,
+            max_new_regions=max_new,
+        )
+        write_pending_tail(
+            state.pending_key,
+            state.pending_z,
+            index_k,
+            index_z,
+            meta,
+            region_size=rs,
+        )
+        state.pending_len[rows_long] = torch.remainder(past + q_lens_dev, rs)
 
         logits = self._score_regions(
             state,
             index_q,
             weights,
-            p.num_query_tokens,
+            num_query_tokens,
             num_reqs,
-            p.seq_lens,
-            p.context_lens,
+            p.seq_lens_host,
+            p.context_lens_host,
             summary_row_offset=md.num_decodes,
         )
         groups = self.num_kv_groups
-        q_positions = positions[token_offset : token_offset + p.num_query_tokens]
-        requests = (
-            torch.arange(
-                md.num_decodes,
-                md.num_decodes + num_reqs,
-                device=q_positions.device,
-                dtype=torch.int32,
-            )
-            .repeat_interleave(
-                torch.tensor(q_lens, device=q_positions.device),
-                output_size=p.num_query_tokens,
-            )
-            .contiguous()
+        q_positions = positions[token_offset : token_offset + num_query_tokens].to(
+            torch.int32
         )
+        # Token -> request map straight from the device start-loc (replaces a
+        # host q_lens list -> H2D tensor -> repeat_interleave chain).
+        requests = (
+            torch.searchsorted(
+                p.query_start_loc,
+                torch.arange(num_query_tokens, device=device, dtype=p.query_start_loc.dtype),
+                right=True,
+            )
+            - 1
+        ).to(torch.int32)
+        if groups > 1:
+            q_positions = q_positions.repeat(groups).contiguous()
+            requests = requests.repeat(groups).contiguous()
         packed, counts = prefill_sparse_meta(
             logits,
-            q_positions.to(torch.int32).repeat(groups).contiguous(),
+            q_positions,
             p.block_table,
-            requests.repeat(groups).contiguous(),
+            requests,
             topk=self.topk_regions,
             region_size=self.region_size,
             regions_per_page=self.regions_per_page,
@@ -904,7 +904,7 @@ class AscendStep4DSAImpl(AttentionImplBase[AscendStep4DSAMetadata]):
             softmax_scale=self.scale,
             block_regions=2,
         )
-        output[token_offset : token_offset + p.num_query_tokens] = out.to(output.dtype)
+        output[token_offset : token_offset + num_query_tokens] = out.to(output.dtype)
 
     def forward(
         self,

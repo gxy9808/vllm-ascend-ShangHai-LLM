@@ -41,8 +41,6 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import AttentionSpec, CrossAttentionSpec
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-
-_DRAFTUPD_COUNT = 0
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
@@ -509,10 +507,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
         self._use_max_workspace_for_fia_graph = self._use_layer_aware_fia_graph_replay
         self.sinks = sinks
         self.layerIndex = 0
-        import os as _os
-        if _os.environ.get("VLLM_STEP4_DBG_ATTN") == "1":
-            print(f"[ATTNINIT] h={num_heads} d={head_size} kvh={self.num_kv_heads} "
-                  f"sw={self.sliding_window} type={attn_type}", flush=True)
         # Some mixed-attention models cannot rely on the iteration order of
         # attn_metadata during graph replay. Record the captured layer name only
         # for that path.
@@ -844,26 +838,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         # persistent full-size buffer), so it must always be
                         # rebound to the current metadata tensor here.
                         block_tables = metadata.block_tables
-                        if _os.environ.get("VLLM_STEP4_DBG_ATTN") == "1":
-                            global _DRAFTUPD_COUNT
-                            _DRAFTUPD_COUNT += 1
-                            if _DRAFTUPD_COUNT <= 160:
-
-                                def _hv(v):
-                                    try:
-                                        if isinstance(v, (list, tuple)):
-                                            return list(v)[:6]
-                                        return list(v.tolist())[:6]
-                                    except Exception:
-                                        return getattr(v, "shape", v)
-
-                                print(
-                                    f"[DRAFTUPD] cnt={_DRAFTUPD_COUNT} step={draft_step} "
-                                    f"kvlen={_hv(seq_lens)} qlen={_hv(actual_seq_lengths_q)} "
-                                    f"bt={tuple(block_tables.shape)} sw={sliding_window} "
-                                    f"sp={sparse_mode} pre={pre_tokens} nt={attn_keys[attn_count]}",
-                                    flush=True,
-                                )
                         attn_count = attn_count + 1
                         if not metadata.causal:
                             sparse_mode = 0
@@ -1356,16 +1330,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
         output: torch.Tensor,
         kv_cache=None,
     ):
-        import os as _os
-        if _os.environ.get("VLLM_STEP4_DBG_ATTN") == "1":
-            _n = globals().get("_DBG_FWD_N", 0)
-            if _n < 500:
-                globals()["_DBG_FWD_N"] = _n + 1
-                _sw = self.sliding_window
-                _lay = getattr(self, "_layer_name", None)
-                print(f"[ATTNFWD#{_n}] lay={_lay} state={attn_metadata.attn_state} ntok={query.shape[0]} "
-                      f"hd={self.head_size} sw={_sw}",
-                      flush=True)
         # we inherit ForwardContext in model runner v2, when enable model
         # runner v2, there is not capturing attribute in forward_context,
         # just use getattr to avoid attribute error.

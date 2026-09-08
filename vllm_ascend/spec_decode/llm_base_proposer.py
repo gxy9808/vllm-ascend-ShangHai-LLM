@@ -3,12 +3,6 @@ import copy
 import inspect as _inspect
 import os as _os
 
-_SPECNORM_COUNT = 0
-_SIFP_COUNT = 0
-_DRET_COUNT = 0
-_NTID_COUNT = 0
-_WINDOW_COUNT = 0
-_D1_COUNT = 0
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from functools import partial
@@ -918,8 +912,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             and getattr(self, "dcp_size", 1) == 1
             and not self.uses_mrope
         ):
-            if _os.environ.get("VLLM_STEP4_DBG_ATTN") == "1":
-                print(f"[MTPPREFILL] tokens={num_tokens} state={_pf_state}", flush=True)
             self._mtp_draft_prefill(common_attn_metadata, num_tokens)
 
         has_lora = len(self.runner.input_batch.lora_id_to_lora_request) > 0
@@ -1271,18 +1263,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         ret_hidden_states = self.model(**model_kwargs)
         last_hidden_states, hidden_states = _split_draft_outputs(ret_hidden_states)
 
-        if _os.environ.get("VLLM_STEP4_DBG_ATTN") == "1":
-            try:
-                _cap = not _EXTRA_CTX.capturing
-            except AssertionError:
-                _cap = True
-            if _cap:
-                print(
-                    f"[HIDPROBE] step0 out last={last_hidden_states.float().mean().item():.4f}/{last_hidden_states.float().std().item():.4f} "
-                    f"recycle={hidden_states.float().mean().item():.4f}/{hidden_states.float().std().item():.4f}",
-                    flush=True,
-                )
-
         # step 1+ skip indexer
         draft_model = getattr(self.model, "model", None)
         if self._share_mtp_indices and draft_model is not None and hasattr(draft_model, "set_skip_topk"):
@@ -1474,26 +1454,68 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         else:
             positions = self.positions[token_indices_to_sample]
         hidden_states = hidden_states[token_indices_to_sample]
+        _mtp_tis_vec = token_indices_to_sample.detach().clone()
         token_indices_to_sample = self.arange[:batch_size]
 
-        input_batch_size = num_input_tokens if (self.method == "mtp" or self.use_cuda_graph) else batch_size
+        if self.method == "mtp" and not self.use_cuda_graph:
+            # Eager MTP: the per-step attn metadata built by
+            # attn_update_stack_num_spec_norm describes a batch_size x 1 decode
+            # batch (qsl=arange[:batch_size+1], num_actual_tokens=batch_size),
+            # so the loop must run only the per-request chain rows. Using
+            # num_input_tokens here feeds stale window rows (frozen tokens at
+            # old positions with stale hiddens) through the MTP layer.
+            input_batch_size = batch_size
+        else:
+            input_batch_size = num_input_tokens if (self.method == "mtp" or self.use_cuda_graph) else batch_size
 
         forward_context = get_forward_context()
         _EXTRA_CTX.num_tokens = input_batch_size
         _EXTRA_CTX.num_accept_tokens = batch_size
 
-        if _os.environ.get("VLLM_STEP4_DBG_ATTN") == "1":
-            try:
-                _cap1 = not _EXTRA_CTX.capturing
-            except AssertionError:
-                _cap1 = True
-            if _cap1:
-                global _D1_COUNT
-                _D1_COUNT += 1
-                if _D1_COUNT <= 80:
-                    print(f"[DRAFTD1] cnt={_D1_COUNT} d1={draft_token_ids[:12].tolist()}", flush=True)
-
-        for draft_index in range(self.num_speculative_tokens - 1):
+        _mtp_rerun = self.method == "mtp" and not self.use_cuda_graph
+        if _mtp_rerun:
+            # Eager MTP: draft d2..dk by re-running the whole window through
+            # the already-verified spec forward path. Each rerun plants the
+            # previous draft token into the next chain row (row tis+j, which
+            # sits at position s+j+1) paired with the target hidden from row
+            # tis (h_{s+1}: hidden of the last committed token) -- the only
+            # true target-style hidden available at draft time. Feeding the
+            # MTP layer's own output hidden back (raw or shared_head.norm'd)
+            # is out-of-distribution for this model, which is trained to
+            # consume a target hidden per MTP call. The next draft is sampled
+            # from the planted row's output.
+            _fctx = get_forward_context()
+            _tis_long = _mtp_tis_vec.long()
+            for _j in range(1, self.num_speculative_tokens):
+                _rows = (_mtp_tis_vec + _j).long()
+                if bool((_rows >= num_input_tokens).any()):
+                    break
+                self.input_ids[_rows] = draft_token_ids_tensor[_j - 1][: _rows.shape[0]].to(self.input_ids.dtype)
+                self.hidden_states[_rows] = self.hidden_states[_tis_long]
+                _ids = self.input_ids[:num_input_tokens]
+                _pos = self._get_positions(num_input_tokens)
+                _hid = self.hidden_states[:num_input_tokens]
+                _kw = {"input_ids": _ids, "positions": _pos, "inputs_embeds": inputs_embeds}
+                if self.pass_hidden_states_to_model:
+                    _hid2, _pos2 = self.maybe_pad_and_reduce(_hid, _pos)
+                    _kw["hidden_states"] = _hid2
+                    if self.method == "mtp":
+                        _kw["positions"] = _pos2
+                if _fctx is not None and multi_steps_attn_metadata:
+                    _fctx.attn_metadata = multi_steps_attn_metadata[0]
+                    _fctx.moe_layer_index = 0
+                _dm = getattr(self.model, "model", None)
+                if self._share_mtp_indices and _dm is not None and hasattr(_dm, "set_skip_topk"):
+                    _dm.set_skip_topk(False)
+                _ret = self.model(**_kw)
+                _lh, _ = _split_draft_outputs(_ret)
+                _lh, _, _ = self.maybe_all_gather_and_unpad(
+                    _lh, _kw["positions"], _lh
+                )
+                _h_fb = _lh[_rows]
+                _dj, _ = self.compute_draft_token_ids(_h_fb, sampling_metadata)
+                draft_token_ids_tensor[_j] = _dj[: _rows.shape[0]]
+        for draft_index in ([] if _mtp_rerun else range(self.num_speculative_tokens - 1)):
             # Reset MOE layer index for each draft step iteration
             forward_context = get_forward_context()
             if forward_context is not None:
@@ -1558,38 +1580,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             if self.pass_hidden_states_to_model:
                 model_kwargs["hidden_states"] = model_hidden_states
 
-            if _os.environ.get("VLLM_STEP4_DBG_ATTN") == "1":
-                try:
-                    _cap = not _EXTRA_CTX.capturing
-                except AssertionError:
-                    _cap = True
-                if _cap:
-                    _r0 = model_hidden_states[0].float()
-                    print(
-                        f"[HIDPROBE] step={draft_index + 1} in tok={model_input_ids[:4].tolist()} "
-                        f"pos={model_positions[:4].tolist()} "
-                        f"hid0={_r0.mean().item():.4f}/{_r0.std().item():.4f} nan0={int(torch.isnan(_r0).sum())} "
-                        f"hidA={model_hidden_states.float().mean().item():.4f}/{model_hidden_states.float().std().item():.4f}",
-                        flush=True,
-                    )
-
             ret_hidden_states = self.model(**model_kwargs)
             last_hidden_states, hidden_states = _split_draft_outputs(ret_hidden_states)
-
-            if _os.environ.get("VLLM_STEP4_DBG_ATTN") == "1":
-                try:
-                    _cap = not _EXTRA_CTX.capturing
-                except AssertionError:
-                    _cap = True
-                if _cap:
-                    _l0 = last_hidden_states[0].float()
-                    _c0 = hidden_states[0].float()
-                    print(
-                        f"[HIDPROBE] step={draft_index + 1} out last0={_l0.mean().item():.4f}/{_l0.std().item():.4f} nanL0={int(torch.isnan(_l0).sum())} "
-                        f"rec0={_c0.mean().item():.4f}/{_c0.std().item():.4f} nanC0={int(torch.isnan(_c0).sum())}",
-                        flush=True,
-                    )
-
             last_hidden_states, model_positions, hidden_states = self.maybe_all_gather_and_unpad(
                 last_hidden_states, model_positions, hidden_states
             )
@@ -1637,11 +1629,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # TODO(wenlong): get more than one token for tree attention
             hidden_states = hidden_states[:batch_size]
             draft_token_ids_tensor[draft_index + 1] = draft_token_ids
-            if _os.environ.get("VLLM_STEP4_DBG_ATTN") == "1":
-                _dn = globals().get("_DBG_DRAFT_N", 0)
-                if _dn < 30:
-                    globals()["_DBG_DRAFT_N"] = _dn + 1
-                    print(f"[DRAFTSTEP] step={draft_index + 1} shape={tuple(draft_token_ids.shape)} ids={draft_token_ids[:12].tolist()}", flush=True)
             if draft_probs_list is not None:
                 if draft_probs_step is not None:
                     draft_probs_list.append(draft_probs_step)
@@ -1652,19 +1639,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         draft_token_ids = draft_token_ids_tensor.swapaxes(0, 1)
         if draft_probs_list is not None:
             self._last_draft_probs = torch.stack(draft_probs_list, dim=1).contiguous()
-        if _os.environ.get("VLLM_STEP4_DBG_ATTN") == "1":
-            try:
-                _cap3 = not _EXTRA_CTX.capturing
-            except AssertionError:
-                _cap3 = True
-            if _cap3:
-                global _DRET_COUNT
-                _DRET_COUNT += 1
-                if _DRET_COUNT <= 60:
-                    print(
-                        f"[DRAFTRET] cnt={_DRET_COUNT} ret={draft_token_ids[:4, :].tolist()}",
-                        flush=True,
-                    )
         return draft_token_ids
 
     def set_inputs_first_pass(
@@ -1687,27 +1661,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # Inserting the next token ids at the last slot in each request.
             if token_indices_to_sample is None:
                 token_indices_to_sample = cad.query_start_loc[1:] - 1
-            if _os.environ.get("VLLM_STEP4_DBG_ATTN") == "1":
-                try:
-                    _cap2 = not _EXTRA_CTX.capturing
-                except AssertionError:
-                    _cap2 = True
-                if _cap2:
-                    global _SIFP_COUNT
-                    _SIFP_COUNT += 1
-                    if _SIFP_COUNT <= 60:
-                        _tis = (
-                            token_indices_to_sample.tolist()
-                            if token_indices_to_sample is not None
-                            else None
-                        )
-                        print(
-                            f"[SIFP] cnt={_SIFP_COUNT} ttoks={target_token_ids[:12].tolist()} "
-                            f"next={next_token_ids[:4].tolist()} tis={_tis} "
-                            f"qsl={cad.query_start_loc[:5].tolist()}",
-                            flush=True,
-                        )
-
             num_tokens = target_token_ids.shape[0]
             # Shift the input ids by one token.
             # E.g., [a1, b1, b2, c1, c2, c3] -> [b1, b2, c1, c2, c3, c3]
@@ -1748,16 +1701,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
             self._set_positions(num_tokens, target_positions)
             self.hidden_states[:num_tokens] = target_hidden_states.view(num_tokens, -1)
-
-            if _os.environ.get("VLLM_STEP4_DBG_ATTN") == "1":
-                global _WINDOW_COUNT
-                _WINDOW_COUNT += 1
-                if _WINDOW_COUNT <= 80:
-                    print(
-                        f"[WINDOW] cnt={_WINDOW_COUNT} ntok={num_tokens} "
-                        f"toks={self.input_ids[:12].tolist()} pos={self.positions[:12].tolist()}",
-                        flush=True,
-                    )
 
             return num_tokens, token_indices_to_sample, cad, long_seq_args
         else:
@@ -1999,7 +1942,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             common_attn_metadata.max_query_len = 1
             common_attn_metadata.decode_token_per_req = 1
             common_attn_metadata.attn_state = (
-                AscendAttentionState.SpecDecoding if self.method == "mtp" else AscendAttentionState.ChunkedPrefill
+                (AscendAttentionState.DecodeOnly if not self.use_cuda_graph else AscendAttentionState.SpecDecoding)
+                if self.method == "mtp"
+                else AscendAttentionState.ChunkedPrefill
             )
             common_attn_metadata.graph_pad_size = -1
             common_attn_metadata.num_input_tokens = input_batch_size
@@ -2123,38 +2068,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         self.seq_lens_group[draft_index][common_attn_metadata.seq_lens.shape[0] :].fill_(0)
         common_attn_metadata.seq_lens = self.seq_lens_group[draft_index][: common_attn_metadata.seq_lens.shape[0]]
 
-        _sn_dbg = _os.environ.get("VLLM_STEP4_DBG_ATTN") == "1"
-        if _sn_dbg:
-            try:
-                _sn_dbg = not _EXTRA_CTX.capturing
-            except AssertionError:
-                _sn_dbg = True
-        if _sn_dbg:
-            global _SPECNORM_COUNT
-            _SPECNORM_COUNT += 1
-            if _SPECNORM_COUNT <= 60:
-                try:
-                    _sl = common_attn_metadata.seq_lens[:8].tolist()
-                except Exception:
-                    _sl = None
-                try:
-                    _sm = common_attn_metadata.slot_mapping[:8].tolist()
-                except Exception:
-                    _sm = None
-                try:
-                    _po = common_attn_metadata.positions[:8].tolist()
-                except Exception:
-                    _po = None
-                try:
-                    _qs = common_attn_metadata.query_start_loc[:9].tolist()
-                except Exception:
-                    _qs = None
-                print(
-                    f"[SPECNORM] cnt={_SPECNORM_COUNT} di={draft_index} bs={batch_size} "
-                    f"ibs={input_batch_size} seqlens={_sl} slots={_sm} pos={_po} qsl={_qs}",
-                    flush=True,
-                )
-
         self.query_start_loc_group[draft_index][: common_attn_metadata.query_start_loc.shape[0]].copy_(
             common_attn_metadata.query_start_loc
         )
@@ -2255,24 +2168,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             selected_tokens,
             self.backup_next_token_ids.gpu[:batch_size],
         )
-
-        if _os.environ.get("VLLM_STEP4_DBG_ATTN") == "1":
-            global _NTID_COUNT
-            _NTID_COUNT += 1
-            if _NTID_COUNT <= 80:
-                _row0 = (
-                    sampled_token_ids[0][:8].tolist()
-                    if sampled_token_ids.dim() > 1
-                    else sampled_token_ids[:8].tolist()
-                )
-                print(
-                    f"[NTID] cnt={_NTID_COUNT} in={_row0} "
-                    f"counts={valid_sampled_tokens_count[:4].tolist()} "
-                    f"sel={selected_tokens[:4].tolist()} "
-                    f"bak={self.backup_next_token_ids.gpu[:4].tolist()} "
-                    f"out={next_token_ids[:4].tolist()}",
-                    flush=True,
-                )
 
         return next_token_ids, valid_sampled_tokens_count
 
