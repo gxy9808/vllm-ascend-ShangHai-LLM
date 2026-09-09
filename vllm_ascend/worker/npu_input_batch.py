@@ -62,6 +62,7 @@ class NPUInputBatch(InputBatch):
         reasoning_config: "ReasoningConfig | None" = None,
         use_replayssm: bool = False,
         slot_mapping_modes: list | None = None,
+        valid_vocab_size: int | None = None,
     ):
         self.use_replayssm = use_replayssm
         self.slot_mapping_modes = slot_mapping_modes
@@ -82,6 +83,9 @@ class NPUInputBatch(InputBatch):
         self.device = device
         self.pin_memory = pin_memory
         self.vocab_size = vocab_size
+        self.valid_vocab_size = (
+            vocab_size if valid_vocab_size is None else valid_vocab_size
+        )
 
         self._req_ids: list[str | None] = []
         self.req_id_to_index: dict[str, int] = {}
